@@ -140,6 +140,26 @@ def test_duplicate_case_and_trial_pairs_are_rejected() -> None:
         Run(manifest=make_manifest(), results=(make_case(), make_case()))
 
 
+def test_trials_of_one_case_with_different_tags_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="case 'case-1' trial 2 has tags"):
+        Run(
+            manifest=make_manifest(),
+            results=(make_case(trial=1, tags=("dac",)), make_case(trial=2, tags=())),
+        )
+
+
+def test_trials_of_one_case_may_list_the_same_tags_in_any_order() -> None:
+    run = Run(
+        manifest=make_manifest(),
+        results=(
+            make_case(trial=1, tags=("dac", "family:share")),
+            make_case(trial=2, tags=("family:share", "dac")),
+        ),
+    )
+
+    assert len(run.results) == 2
+
+
 def test_the_same_case_in_different_trials_is_accepted() -> None:
     run = Run(manifest=make_manifest(), results=(make_case(trial=1), make_case(trial=2)))
 

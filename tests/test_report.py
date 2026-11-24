@@ -239,6 +239,14 @@ def test_tags_of_is_applied_to_cases_and_task_failures():
     }
 
 
+def test_tags_that_differ_between_repeats_raise_before_the_run_is_saved():
+    report = evaluate([Case(name="a", inputs={"x": 1})], is_even, repeat=2)
+    trials = iter((("dac",), ()))
+
+    with pytest.raises(ValueError, match="tags must be the same on every trial"):
+        run_from_report(report=report, manifest=MANIFEST, tags_of=lambda _: next(trials))
+
+
 def test_results_are_ordered_by_case_id_then_trial():
     report = evaluate(
         [

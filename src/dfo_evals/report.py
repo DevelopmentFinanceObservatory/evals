@@ -81,8 +81,8 @@ def run_from_report(
     Args:
         report: The report ``Dataset.evaluate`` returned.
         manifest: Metadata of the run that produced the report.
-        tags_of: Derives a case's tags from its report case or task failure. None
-            gives every case no tags.
+        tags_of: Derives a case's tags from its report case or task failure. It must
+            give every trial of a case the same tags. None gives every case no tags.
         fault_of: Classifies who is at fault for a case or task failure, such as
             ``INFRA`` for a timeout.
 
@@ -91,7 +91,8 @@ def run_from_report(
 
     Raises:
         ValueError: The report holds output from report-level evaluators, an evaluator
-            is named ``task``, a case has no name, a case and trial appear twice, a label is not a verdict, or an
+            is named ``task``, a case has no name, a case and trial appear twice,
+            trials of a case carry different tags, a label is not a verdict, or an
             evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
