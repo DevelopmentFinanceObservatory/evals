@@ -110,15 +110,14 @@ jobs:
   # Consumers pin their own pydantic-ai-slim (ai is on 2.66), and each pydantic-evals
   # release pins pydantic-ai-slim exactly, so the declared lower bounds must work.
   test-lowest:
-    if: >-
-      github.event.pull_request.draft != true &&
-      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Set up Python 3.12
         run: uv python install 3.12
