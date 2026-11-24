@@ -9,6 +9,7 @@ from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
 from dfo_evals.langfuse_sink import (
     DatasetItemRef,
     DatasetItemSpec,
+    InputMismatchError,
     PushIncompleteError,
     PushMismatchError,
     PushTimeoutError,
@@ -21,6 +22,7 @@ from dfo_evals.langfuse_sink import (
     verify_pushed,
 )
 from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.report import input_digest
 
 _PROJECT = "project-1"
 _DATASET = "search-core"
@@ -132,6 +134,7 @@ class _FakeLangfuse:
                 {
                     "experiment": run_name,
                     "item": item.id,
+                    "input": item.input,
                     "dataset_id": item.dataset_id,
                     "trace_id": f"trace-{len(self.runs)}",
                     "output": json.dumps(output),
@@ -178,6 +181,8 @@ class _FakeLangfuse:
                 SimpleNamespace(
                     id=run["trace_id"],
                     trace_id=run["trace_id"],
+                    experiment_item_id=run["item"],
+                    input=json.dumps(_js_numbers(run["input"])),
                     output=json.dumps(_js_numbers(json.loads(run["output"]))),
                     metadata=run["metadata"],
                     scores=[]
@@ -215,7 +220,7 @@ def _result(
     return CaseResult(
         case_id=case_id,
         trial=trial,
-        input_digest=f"sha256:{case_id}",
+        input_digest=input_digest(_input(case_id)),
         checks=tuple(CheckResult(name=name, verdict=v) for name, v in verdicts.items()),
         fault=FaultClass.AGENT if Verdict.FAIL in verdicts.values() else None,
         duration_s=duration_s,
@@ -240,6 +245,11 @@ def _run(*results: CaseResult, run_id: str = "20261101T000000Z") -> Run:
     )
 
 
+def _input(case_id: str) -> dict[str, str]:
+    """The input the run evaluated case `case_id` on."""
+    return {"q": case_id}
+
+
 def _item_id(case_id: str, dataset: str = _DATASET) -> str:
     return f"{dataset}:search-case-{case_id}"
 
@@ -258,7 +268,7 @@ def _add_items(fake: _FakeLangfuse, *case_ids: str, dataset: str = _DATASET) -> 
     upsert_items(
         client=fake,
         dataset=dataset,
-        items=[DatasetItemSpec(item_id=_item_id(c, dataset), input={"q": c}) for c in case_ids],
+        items=[DatasetItemSpec(item_id=_item_id(c, dataset), input=_input(c)) for c in case_ids],
     )
     fake.item_writes.clear()
 
@@ -384,7 +394,7 @@ def test_every_trial_of_a_case_goes_in_one_item_run_scored_as_its_pass_share() -
         "duration_s": 1.5,
         "cost_usd": 0.01,
         "tags": ["core"],
-        "input_digest": "sha256:a",
+        "input_digest": input_digest(_input("a")),
         "trace_id": "sut-a-2",
     }
 
@@ -460,6 +470,103 @@ def test_a_case_shown_in_a_dataset_it_does_not_map_to_is_a_mismatch() -> None:
 
     with pytest.raises(PushMismatchError, match=rf"\['b'\].*'{_DATASET}'"):
         _verify(fake, _TWO_CASES, name, item_of=_split_item, timeout_s=0)
+
+
+def test_the_same_run_pushed_to_another_dataset_is_written_and_verified_there() -> None:
+    fake = _with_items("a", "b")
+    _add_items(fake, "a", "b", dataset=_OTHER_DATASET)
+
+    def other(case_id: str) -> DatasetItemRef:
+        return DatasetItemRef(dataset=_OTHER_DATASET, item_id=_item_id(case_id, _OTHER_DATASET))
+
+    name = _push(fake, _TWO_CASES)
+    assert _push(fake, _TWO_CASES, item_of=other) == name
+
+    other_id = fake.datasets[_OTHER_DATASET]
+    assert sorted(run["item"] for run in fake.runs if run["dataset_id"] == other_id) == [
+        _item_id("a", _OTHER_DATASET),
+        _item_id("b", _OTHER_DATASET),
+    ]
+    assert fake.experiments == [(name, {_DATASET}), (name, {_OTHER_DATASET})]
+    _verify(fake, _TWO_CASES, name, item_of=other, timeout_s=0)
+
+
+def test_an_item_input_changed_after_the_run_is_refused_before_writing() -> None:
+    fake = _with_items("a")
+    _add_items(fake, "b", dataset=_OTHER_DATASET)
+    upsert_items(
+        client=fake,
+        dataset=_OTHER_DATASET,
+        items=[DatasetItemSpec(item_id=_item_id("b", _OTHER_DATASET), input={"q": "edited"})],
+    )
+    fake.item_writes.clear()
+
+    with pytest.raises(InputMismatchError, match=rf"dataset '{_OTHER_DATASET}' cases \['b'\]"):
+        _push(fake, _TWO_CASES, item_of=_split_item)
+
+    assert (fake.runs, fake.experiments, fake.item_writes) == ([], [], [])
+
+
+def test_an_item_input_changed_after_a_push_fails_verification() -> None:
+    fake = _with_items("a", "b")
+    name = _push(fake, _TWO_CASES)
+    upsert_items(
+        client=fake,
+        dataset=_DATASET,
+        items=[DatasetItemSpec(item_id=_item_id("a"), input={"q": "edited"})],
+    )
+
+    with pytest.raises(InputMismatchError, match=r"\['a'\]"):
+        _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_a_run_that_digested_a_whole_float_matches_an_item_read_back_as_an_int() -> None:
+    fake = _FakeLangfuse()
+    upsert_items(
+        client=fake,
+        dataset=_DATASET,
+        items=[DatasetItemSpec(item_id=_item_id("a"), input={"q": "a", "n": 1})],
+    )
+    run = _run(
+        _result("a", answer=Verdict.PASS).model_copy(
+            update={"input_digest": input_digest({"q": "a", "n": 1.0})}
+        )
+    )
+
+    name = _push(fake, run)
+
+    _verify(fake, run, name, timeout_s=0)
+
+
+def test_an_item_run_on_another_input_fails_verification() -> None:
+    fake = _with_items("a", "b")
+    name = _push(fake, _TWO_CASES)
+    fake.runs_of("a")[0]["input"] = {"q": "other"}
+
+    with pytest.raises(PushMismatchError, match="another input"):
+        _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_an_item_run_of_another_item_fails_verification() -> None:
+    fake = _with_items("a", "b")
+    name = _push(fake, _TWO_CASES)
+    fake.runs_of("a")[0]["item"] = _item_id("b")
+
+    with pytest.raises(PushMismatchError, match=r"item run of .*search-case-b"):
+        _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_trials_of_one_case_with_different_input_digests_are_refused() -> None:
+    fake = _with_items("a")
+    run = _run(
+        _result("a", 1, answer=Verdict.PASS),
+        _result("a", 2, answer=Verdict.PASS).model_copy(update={"input_digest": "sha256:x"}),
+    )
+
+    with pytest.raises(ValueError, match="different input digests"):
+        _push(fake, run)
+
+    assert fake.runs == []
 
 
 def test_two_cases_mapped_to_one_item_are_refused() -> None:

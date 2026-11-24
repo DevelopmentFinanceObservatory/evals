@@ -9,6 +9,12 @@ so every dataset keeps its own item ids and run history. Langfuse runs nothing: 
 experiment's task returns the output the run already holds and its evaluator returns
 the scores the run's verdicts already give.
 
+A dataset item's input must be the case's inputs exactly as the run evaluated them:
+``input_digest`` of the item's input must equal every trial's stored ``input_digest``.
+A push or verification over an item whose input differs refuses before writing, and
+each item run read back must be of the item its case maps to, in that item's dataset,
+and must hold that same input.
+
 Langfuse shows one item run per dataset item in an experiment, so a case has one item
 run however many trials it ran. Its output holds every trial's result (and the caller's
 output for that trial, if given) in trial order. Each check is scored once per case, as
@@ -93,6 +99,10 @@ class UnknownCaseError(LangfuseSinkError):
     """The run holds a case with no item in the dataset it maps to."""
 
 
+class InputMismatchError(LangfuseSinkError):
+    """A dataset item's input is not the input the run evaluated its case on."""
+
+
 class PushMismatchError(LangfuseSinkError):
     """Langfuse holds something under the experiment that the run does not."""
 
@@ -157,6 +167,8 @@ class _ItemRun:
     """One case's item run as Langfuse shows it."""
 
     trace_id: str
+    item_id: str
+    input: object
     case_digest: str
     output: object
     output_digest: str
@@ -281,7 +293,10 @@ def push_run(
     """Push a run as one experiment, sending only what Langfuse lacks.
 
     Every case of the run must already be an item of the dataset ``item_of`` maps it to
-    (``upsert_items``). The run lands as one dataset run in each dataset its cases map
+    (``upsert_items``), and that item's input must be the case's inputs exactly as the
+    run evaluated them: its ``input_digest`` must equal the case's stored
+    ``input_digest``. Item runs already in Langfuse count as pushed only when they are
+    of the mapped item in its dataset and hold that input. The run lands as one dataset run in each dataset its cases map
     to, all under one run name. After sending, Langfuse is read back until it shows
     every case and score, so a push that returns has been checked as ``verify_pushed``
     checks it.
@@ -300,11 +315,15 @@ def push_run(
     Raises:
         UnknownCaseError: A case has no item in the dataset it maps to. Nothing is
             written.
-        ValueError: ``outputs`` names a case and trial the run lacks, two cases map to
-            one item, the revision holds a comma, a case scores more checks than
-            Langfuse reads back, or a dataset item has no input. Nothing is written.
+        InputMismatchError: A case's item input is not the input the run evaluated.
+            Nothing is written.
+        ValueError: ``outputs`` names a case and trial the run lacks, a case's trials
+            hold different input digests, two cases map to one item, the revision holds
+            a comma, a case scores more checks than Langfuse reads back, or a dataset
+            item has no input. Nothing is written.
         PushMismatchError: Langfuse holds a case under this experiment that differs from
-            the run's, or holds it in a dataset the case does not map to.
+            the run's, in a dataset or item the case does not map to, or on another
+            input.
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
             the run again sends them.
         PushTimeoutError: Every case appeared but some scores did not within
@@ -315,10 +334,12 @@ def push_run(
         raise ValueError(f"outputs name case trials the run lacks: {extra}")
 
     by_case = _results_by_case(run)
+    input_digests = _case_input_digests(by_case)
     groups = _group_cases(client=client, case_ids=list(by_case), item_of=item_of)
     for group in groups:
         if no_input := [item.id for item in group.items.values() if item.input is None]:
             raise ValueError(f"dataset {group.dataset!r}: items have no input: {no_input}")
+    _check_inputs(groups=groups, input_digests=input_digests)
     expected_scores = {case_id: case_scores(results) for case_id, results in by_case.items()}
     if over := [c for c, scores in expected_scores.items() if len(scores) > _MAX_SCORES]:
         raise ValueError(
@@ -330,7 +351,9 @@ def push_run(
         case_id: _case_output(case_id, results, outputs) for case_id, results in by_case.items()
     }
 
-    held = _read_pushed(client=client, run=run, run_name=run_name, groups=groups)
+    held = _read_pushed(
+        client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+    )
     for case_id, item_run in held.items():
         if item_run.case_digest != _case_digest(by_case[case_id]):
             raise PushMismatchError(
@@ -382,7 +405,12 @@ def push_run(
     )
 
     shown, missing = _await_visible(
-        client=client, run=run, run_name=run_name, groups=groups, timeout_s=timeout_s
+        client=client,
+        run=run,
+        run_name=run_name,
+        groups=groups,
+        input_digests=input_digests,
+        timeout_s=timeout_s,
     )
     if never := [case_id for case_id in pending if case_id not in shown]:
         raise PushIncompleteError(
@@ -408,7 +436,9 @@ def verify_pushed(
 ) -> None:
     """Wait until Langfuse shows every case and score of a pushed run, and check them.
 
-    Each dataset the run's cases map to is read back under ``run_name``.
+    Each dataset the run's cases map to is read back under ``run_name``. As for
+    ``push_run``, each case's dataset item must hold the input the run evaluated, and
+    each item run must be of the mapped item and hold that input.
 
     Args:
         client: The Langfuse client.
@@ -419,14 +449,24 @@ def verify_pushed(
 
     Raises:
         UnknownCaseError: A case has no item in the dataset it maps to.
-        ValueError: Two cases map to one item.
+        InputMismatchError: A case's item input is not the input the run evaluated.
+        ValueError: Two cases map to one item, or a case's trials hold different input
+            digests.
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
-            shows a case in a dataset it does not map to.
+            shows a case in a dataset or item it does not map to, or on another input.
         PushTimeoutError: Langfuse still lacks a case or score after ``timeout_s``.
     """
-    groups = _group_cases(client=client, case_ids=list(_results_by_case(run)), item_of=item_of)
+    by_case = _results_by_case(run)
+    input_digests = _case_input_digests(by_case)
+    groups = _group_cases(client=client, case_ids=list(by_case), item_of=item_of)
+    _check_inputs(groups=groups, input_digests=input_digests)
     _, missing = _await_visible(
-        client=client, run=run, run_name=run_name, groups=groups, timeout_s=timeout_s
+        client=client,
+        run=run,
+        run_name=run_name,
+        groups=groups,
+        input_digests=input_digests,
+        timeout_s=timeout_s,
     )
     if missing:
         # No re-push hint: a slow Langfuse would get the same cases and scores twice.
@@ -441,6 +481,7 @@ def _await_visible(
     run: Run,
     run_name: str,
     groups: Sequence[_DatasetCases],
+    input_digests: Mapping[str, str],
     timeout_s: float,
 ) -> tuple[dict[str, _ItemRun], list[str]]:
     """Read Langfuse back until it shows every case and score of a run, or time runs out.
@@ -451,7 +492,7 @@ def _await_visible(
 
     Raises:
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
-            a case in a dataset it does not map to.
+            a case in a dataset or item it does not map to, or on another input.
     """
     by_case = _results_by_case(run)
     expected_digests = {case_id: _case_digest(results) for case_id, results in by_case.items()}
@@ -462,7 +503,9 @@ def _await_visible(
 
     deadline = time.monotonic() + timeout_s
     while True:
-        held = _read_pushed(client=client, run=run, run_name=run_name, groups=groups)
+        held = _read_pushed(
+            client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+        )
         _check_matches(
             held=held, digests=expected_digests, scores=expected_scores, run_name=run_name
         )
@@ -574,13 +617,19 @@ def _send(
 
 
 def _read_pushed(
-    *, client: Langfuse, run: Run, run_name: str, groups: Sequence[_DatasetCases]
+    *,
+    client: Langfuse,
+    run: Run,
+    run_name: str,
+    groups: Sequence[_DatasetCases],
+    input_digests: Mapping[str, str],
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in each dataset, by case id.
 
     Raises:
-        PushMismatchError: An item run lacks the metadata a push writes, or is of a case
-            the run does not map to its dataset.
+        PushMismatchError: An item run lacks the metadata a push writes, is of a case the
+            run does not map to its dataset, is of another item than the case maps to,
+            or holds another input than the run evaluated.
     """
     found: dict[str, _ItemRun] = {}
     for group in groups:
@@ -592,6 +641,17 @@ def _read_pushed(
                 f"Langfuse shows cases {stray} under {run_name} in dataset "
                 f"{group.dataset!r}, which the run does not map there"
             )
+        for case_id, item_run in shown.items():
+            if item_run.item_id != (mapped := group.items[case_id].id):
+                raise PushMismatchError(
+                    f"case {case_id!r} under {run_name} in dataset {group.dataset!r} is an "
+                    f"item run of {item_run.item_id!r}, not of {mapped!r}"
+                )
+            if not _input_matches(item_run.input, input_digests[case_id]):
+                raise PushMismatchError(
+                    f"case {case_id!r} under {run_name} in dataset {group.dataset!r} ran on "
+                    "another input than the run evaluated"
+                )
         found |= shown
     return found
 
@@ -629,6 +689,8 @@ def _read_dataset_run(
                 str(metadata[_CASE_ID_KEY]),
                 _ItemRun(
                     trace_id=item.trace_id,
+                    item_id=item.experiment_item_id,
+                    input=_parsed(item.input),
                     case_digest=str(metadata[_CASE_DIGEST_KEY]),
                     output=_parsed(item.output),
                     output_digest=str(metadata[_OUTPUT_DIGEST_KEY]),
@@ -739,6 +801,52 @@ def _group_cases(
     return groups
 
 
+def _case_input_digests(by_case: Mapping[str, Sequence[CaseResult]]) -> dict[str, str]:
+    """The stored input digest of each case, which all its trials share.
+
+    Raises:
+        ValueError: A case's trials hold different input digests.
+    """
+    digests = {}
+    for case_id, results in by_case.items():
+        found = {result.input_digest for result in results}
+        if len(found) != 1:
+            raise ValueError(f"case {case_id!r}: trials hold different input digests {found}")
+        digests[case_id] = found.pop()
+    return digests
+
+
+def _check_inputs(*, groups: Sequence[_DatasetCases], input_digests: Mapping[str, str]) -> None:
+    """Refuse any case whose dataset item input is not the input the run evaluated.
+
+    Raises:
+        InputMismatchError: Some item inputs differ, named by dataset and case.
+    """
+    differ = [
+        f"dataset {group.dataset!r} cases {cases}"
+        for group in groups
+        if (cases := _cases_on_other_input(group=group, input_digests=input_digests))
+    ]
+    if differ:
+        raise InputMismatchError(
+            f"item inputs differ from the inputs the run evaluated: {'; '.join(differ)}"
+        )
+
+
+def _cases_on_other_input(*, group: _DatasetCases, input_digests: Mapping[str, str]) -> list[str]:
+    """The cases of one dataset whose item input is not the input the run evaluated."""
+    return [
+        case_id
+        for case_id, item in group.items.items()
+        if not _input_matches(item.input, input_digests[case_id])
+    ]
+
+
+def _input_matches(value: object, digest: str) -> bool:
+    """Whether a value read from Langfuse is the input a stored input digest names."""
+    return input_digest(value) == digest
+
+
 def _results_by_case(run: Run) -> dict[str, list[CaseResult]]:
     """Group a run's results by case id, each case's trials in order."""
     by_case: defaultdict[str, list[CaseResult]] = defaultdict(list)
@@ -793,18 +901,7 @@ def _case_digest(results: Sequence[CaseResult]) -> str:
 def _digest(value: object) -> str:
     """Digest any JSON-serialisable value by its canonical JSON, whole floats as ints."""
     # input_digest is a canonical JSON digest of any value, not only inputs.
-    return input_digest(_whole_floats_as_ints(to_jsonable_python(value)))
-
-
-def _whole_floats_as_ints(value: object) -> object:
-    """Turn every whole-number float into an int, as JSON read back from Langfuse has it."""
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, dict):
-        return {key: _whole_floats_as_ints(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_whole_floats_as_ints(item) for item in value]
-    return value
+    return input_digest(value)
 
 
 def _parsed(output: object) -> object:
