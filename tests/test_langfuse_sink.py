@@ -50,12 +50,17 @@ class _FakeLangfuse:
     leave no item run and no item result.
     `api.experiments.list_items` reads one experiment's item runs back newest first, in one
     dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs
-    written as ints, as JavaScript writes JSON. Item runs start at `now`, and their scores
-    read back only when timestamped within `_SCORE_WINDOW` of the page's item runs and
-    no later than `now`. `create_score` records each write in `score_writes`.
-    The next push loses its first `drop_runs` item runs, and the scores of the next
-    `drop_scores`, as a failed send would. `hide_scores` keeps scores from reading back,
-    and the next `hidden_reads` reads show nothing, as before Langfuse shows a push.
+    written as ints, as JavaScript writes JSON. Item runs start at `now`.
+    `scores` holds every score as Langfuse stores it, one per id and timestamp, so a
+    score written twice under one id and timestamp is overwritten and any other second
+    write shows as a second score; an evaluator's score and one written without an id
+    get a random id. An item run reads back the scores on its observation or on its
+    trace alone, one per id, timestamped within `_SCORE_WINDOW` of the page's item runs
+    and no later than `now`. `create_score` records each write in `score_writes`.
+    The next push loses its first `drop_runs` item runs, and the next `drop_scores`
+    score writes are lost, as a failed send would. `hide_scores` keeps scores from
+    reading back, and the next `hidden_reads` reads show nothing, as before Langfuse
+    shows a push.
     """
 
     def __init__(self, *, project: str = _PROJECT) -> None:
@@ -72,6 +77,7 @@ class _FakeLangfuse:
         self.hidden_reads = 0
         self.score_limits: list[int] = []
         self.score_writes: list[dict[str, Any]] = []
+        self.scores: list[dict[str, Any]] = []
         self.now = _STARTED + datetime.timedelta(hours=1)
         self.api = SimpleNamespace(
             projects=SimpleNamespace(
@@ -163,9 +169,17 @@ class _FakeLangfuse:
             if self.drop_runs:
                 self.drop_runs -= 1
                 continue
-            if self.drop_scores:
-                self.drop_scores -= 1
-                evaluations = []
+            trace_id, observation_id = f"trace-{len(self.runs)}", f"obs-{len(self.runs)}"
+            for evaluation in evaluations:
+                self._store_score(
+                    id=str(uuid.uuid4()),
+                    timestamp=self.now,
+                    trace_id=trace_id,
+                    observation_id=observation_id,
+                    name=evaluation.name,
+                    value=evaluation.value,
+                    data_type=evaluation.data_type,
+                )
             self.runs.append(
                 {
                     "experiment": run_name,
@@ -173,15 +187,13 @@ class _FakeLangfuse:
                     "item": item.id,
                     "input": item.input,
                     "dataset_id": item.dataset_id,
-                    "trace_id": f"trace-{len(self.runs)}",
+                    "trace_id": trace_id,
+                    "observation_id": observation_id,
                     "output": json.dumps(output),
                     "metadata": {
                         key: str(value) for key, value in {**metadata, **item.metadata}.items()
                     },
                     "start_time": self.now,
-                    "scores": {e.name: e.value for e in evaluations},
-                    "score_times": {e.name: self.now for e in evaluations},
-                    "data_types": {e.name: e.data_type for e in evaluations},
                 }
             )
         return SimpleNamespace(item_results=results)
@@ -193,16 +205,38 @@ class _FakeLangfuse:
         name: str,
         value: float,
         data_type: str,
+        observation_id: str | None = None,
         score_id: str | None = None,
         timestamp: datetime.datetime | None = None,
     ) -> None:
-        self.score_writes.append(
-            {"id": score_id, "trace_id": trace_id, "name": name, "timestamp": timestamp}
-        )
-        run = next(run for run in self.runs if run["trace_id"] == trace_id)
-        run["scores"][name] = value
-        run["score_times"][name] = timestamp or self.now
-        run["data_types"][name] = data_type
+        write = {
+            "id": score_id or str(uuid.uuid4()),
+            "timestamp": timestamp or self.now,
+            "trace_id": trace_id,
+            "observation_id": observation_id,
+            "name": name,
+            "value": value,
+            "data_type": data_type,
+        }
+        self.score_writes.append(write)
+        if self.drop_scores:
+            self.drop_scores -= 1
+            return
+        self._store_score(**write)
+
+    def _store_score(self, **score: Any) -> None:
+        key = (score["id"], score["timestamp"])
+        self.scores = [s for s in self.scores if (s["id"], s["timestamp"]) != key]
+        self.scores.append(score)
+
+    def scores_of(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Every score Langfuse holds on an item run, duplicates included."""
+        return [
+            s
+            for s in self.scores
+            if s["observation_id"] == run["observation_id"]
+            or (s["trace_id"] == run["trace_id"] and s["observation_id"] is None)
+        ]
 
     def flush(self) -> None:
         pass
@@ -235,7 +269,7 @@ class _FakeLangfuse:
         return SimpleNamespace(
             data=[
                 SimpleNamespace(
-                    id=run["trace_id"],
+                    id=run["observation_id"],
                     trace_id=run["trace_id"],
                     start_time=run["start_time"],
                     experiment_id=run["experiment_id"],
@@ -246,9 +280,9 @@ class _FakeLangfuse:
                     scores=[]
                     if self.hide_scores
                     else [
-                        SimpleNamespace(name=n, value=v)
-                        for n, v in run["scores"].items()
-                        if earliest <= run["score_times"][n] <= latest
+                        SimpleNamespace(name=score["name"], value=score["value"])
+                        for score in {s["id"]: s for s in self.scores_of(run)}.values()
+                        if earliest <= score["timestamp"] <= latest
                     ],
                 )
                 for run in page
@@ -258,6 +292,11 @@ class _FakeLangfuse:
 
     def runs_of(self, case_id: str) -> list[dict[str, Any]]:
         return [run for run in self.runs if run["metadata"]["case_id"] == case_id]
+
+
+def _score_values(fake: _FakeLangfuse, run: dict[str, Any]) -> dict[str, float]:
+    """The value of each score Langfuse holds on an item run, by name."""
+    return {score["name"]: score["value"] for score in fake.scores_of(run)}
 
 
 def _experiment_id(dataset: str, run_name: str) -> str:
@@ -468,9 +507,9 @@ def test_pass_scores_one_fail_scores_zero_and_other_verdicts_are_not_scored() ->
     (a,) = fake.runs_of("a")
     (b,) = fake.runs_of("b")
     assert a["item"] == _item_id("a")
-    assert a["scores"] == {"answer": 1.0, "rows": 0.0}
-    assert set(a["data_types"].values()) == {"NUMERIC"}
-    assert b["scores"] == {}
+    assert _score_values(fake, a) == {"answer": 1.0, "rows": 0.0}
+    assert {score["data_type"] for score in fake.scores_of(a)} == {"NUMERIC"}
+    assert _score_values(fake, b) == {}
 
 
 def test_every_trial_of_a_case_goes_in_one_item_run_scored_as_its_pass_share() -> None:
@@ -485,7 +524,7 @@ def test_every_trial_of_a_case_goes_in_one_item_run_scored_as_its_pass_share() -
     _push(fake, run, outputs={("a", 1): {"answer": 42}, ("a", 3): "text"})
 
     (a,) = fake.runs_of("a")
-    assert a["scores"] == {"answer": 0.75, "rows": 1.0}
+    assert _score_values(fake, a) == {"answer": 0.75, "rows": 1.0}
     output = json.loads(a["output"])
     assert [r["trial"] for r in output["results"]] == [1, 2, 3, 4]
     assert output["outputs"] == [{"answer": 42}, None, "text", None]
@@ -785,13 +824,13 @@ def test_a_push_whose_scores_were_lost_raises_and_pushing_again_fills_them() -> 
     fake = _with_items("a", "b")
     fake.drop_scores = 2
 
-    with pytest.raises(PushTimeoutError, match="push the run again to write the missing scores"):
+    with pytest.raises(PushTimeoutError, match="pushing the run again writes them again"):
         _push(fake, _TWO_CASES)
-    assert all(run["scores"] == {} for run in fake.runs)
+    assert fake.scores == []
     name = _push(fake, _TWO_CASES)
 
     assert len(fake.runs) == 2
-    assert fake.runs_of("a")[0]["scores"] == {"answer": 1.0, "rows": 0.0}
+    assert _score_values(fake, fake.runs_of("a")[0]) == {"answer": 1.0, "rows": 0.0}
     _verify(fake, _TWO_CASES, name, timeout_s=0)
 
 
@@ -821,10 +860,42 @@ def test_a_score_repaired_twice_is_written_under_the_same_id_and_time() -> None:
         with pytest.raises(PushTimeoutError):
             _push(fake, _TWO_CASES)
 
-    first, second = fake.score_writes[:2], fake.score_writes[2:]
+    first, second, third = (fake.score_writes[i : i + 2] for i in (0, 2, 4))
+    assert len(fake.score_writes) == 6
     assert [w["name"] for w in first] == ["answer", "rows"]
-    assert first == second
+    assert first == second == third
     assert len({w["id"] for w in first}) == 2
+
+
+def test_a_late_score_written_again_stays_one_score() -> None:
+    fake = _with_items("a", "b")
+    # The scores land but do not show before the push gives up, nor on the next push.
+    fake.hide_scores = True
+    with pytest.raises(PushTimeoutError):
+        _push(fake, _TWO_CASES)
+    with pytest.raises(PushTimeoutError):
+        _push(fake, _TWO_CASES)
+    fake.hide_scores = False
+
+    (a,) = fake.runs_of("a")
+    name = a["experiment"]
+    assert len(fake.score_writes) == 4
+    assert sorted(score["name"] for score in fake.scores_of(a)) == ["answer", "rows"]
+    _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_every_score_is_written_once_on_the_item_run_and_a_repeat_push_writes_none() -> None:
+    fake = _with_items("a", "b")
+
+    name = _push(fake, _TWO_CASES)
+    assert _push(fake, _TWO_CASES) == name
+
+    (a,) = fake.runs_of("a")
+    assert [(w["name"], w["trace_id"], w["observation_id"]) for w in fake.score_writes] == [
+        ("answer", a["trace_id"], a["observation_id"]),
+        ("rows", a["trace_id"], a["observation_id"]),
+    ]
+    assert {w["timestamp"] for w in fake.score_writes} == {a["start_time"]}
 
 
 def test_a_case_that_never_appears_raises_and_pushing_again_sends_only_it() -> None:
@@ -952,7 +1023,7 @@ def test_verify_pushed_passes_on_a_complete_push() -> None:
 def test_verify_pushed_raises_when_a_score_is_missing() -> None:
     fake = _with_items("a", "b")
     name = _push(fake, _TWO_CASES)
-    del fake.runs_of("a")[0]["scores"]["rows"]
+    fake.scores = [s for s in fake.scores if s["name"] != "rows"]
 
     with pytest.raises(PushTimeoutError, match=r"case 'a' scores \['rows'\]"):
         _verify(fake, _TWO_CASES, name, timeout_s=0)
@@ -961,7 +1032,7 @@ def test_verify_pushed_raises_when_a_score_is_missing() -> None:
 def test_verify_pushed_raises_when_a_score_differs() -> None:
     fake = _with_items("a", "b")
     name = _push(fake, _TWO_CASES)
-    fake.runs_of("a")[0]["scores"]["rows"] = 1.0
+    next(s for s in fake.scores if s["name"] == "rows")["value"] = 1.0
 
     with pytest.raises(PushMismatchError, match=r"score 'rows' is 1\.0"):
         _verify(fake, _TWO_CASES, name, timeout_s=0)

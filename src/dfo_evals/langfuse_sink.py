@@ -6,8 +6,8 @@ The caller maps each case to its dataset and item (``DatasetItemRef``), so one r
 span several datasets, as a suite that keeps one dataset per corpus file does. The run
 then lands as one dataset run in each of those datasets, all under the same run name,
 so every dataset keeps its own item ids and run history. Langfuse runs nothing: the
-experiment's task returns the output the run already holds and its evaluator returns
-the scores the run's verdicts already give.
+experiment's task returns the output the run already holds, and the scores the run's
+verdicts already give are written once its item runs show.
 
 A dataset item's input must be the case's inputs exactly as the run evaluated them:
 ``input_digest`` of the item's input must equal every trial's stored ``input_digest``.
@@ -21,11 +21,14 @@ output for that trial, if given) in trial order. Each check is scored once per c
 the share of the case's trials whose verdict on it is a pass, over the trials that passed
 or failed it: 1.0 or 0.0 for a case run once, as a single-trial suite scores today.
 Unverifiable, n/a and unreached verdicts are left out, and a check no trial passed or
-failed gets no score. A score missing from an item run already in Langfuse is written
-by ``create_score`` with an id derived from the run name, dataset, item and check, and
-the item run's start time as its timestamp: Langfuse reads an item run's scores back
-only within a day of the item runs, and a score sent again with the same id and
-timestamp overwrites the first. Each trial's number, fault, duration, cost, tags, input
+failed gets no score. Every score is written one way, by ``create_score`` on the item
+run's trace and observation (what Langfuse reads an item run's scores back by), with an
+id derived from the run name, dataset, item and check, and the item run's start time as
+its timestamp: Langfuse reads an item run's scores back only within a day of the item
+runs, and a score sent again with the same id and timestamp overwrites the first. So a
+push sends the item runs with no evaluator, waits to see them, then writes their
+scores, and a score written again by a later push, because it was slow to show, stays
+one score. Each trial's number, fault, duration, cost, tags, input
 digest and trace id are in the item run's metadata under ``trials``.
 
 The experiment is named ``<suite>/<run_id> <revision> <digest>``, where ``<digest>``
@@ -103,7 +106,7 @@ _TRIALS_KEY: Final = "trials"
 # The shape of the experiment id the SDK falls back to when it cannot link an item run
 # to the dataset run: an OpenTelemetry span id. A dataset run's id is a UUID.
 _FALLBACK_EXPERIMENT_ID: Final = re.compile(r"^[0-9a-f]{16}$")
-# Namespace of the score ids a push writes when it repairs a missing score.
+# Namespace of the ids of the scores a push writes.
 _SCORE_ID_NAMESPACE: Final = uuid.uuid5(
     uuid.NAMESPACE_URL, "https://github.com/DevelopmentFinanceObservatory/evals/langfuse-score"
 )
@@ -199,6 +202,7 @@ class _ItemRun:
     """One case's item run as Langfuse shows it."""
 
     trace_id: str
+    observation_id: str
     start_time: datetime
     item_id: str
     input: object
@@ -332,8 +336,11 @@ def push_run(
     ``input_digest``. Item runs already in Langfuse count as pushed only when they are
     of the mapped item in its dataset and hold that input. The run lands as one dataset
     run in each dataset its cases map to, all under one run name. After sending,
-    Langfuse is read back until it shows every case and score, so a push that returns
-    has been checked as ``verify_pushed`` checks it.
+    Langfuse is read back until it shows every case, each case's scores are written
+    under stable ids and its item run's start time, and Langfuse is read back again
+    until it shows every score, so a push that returns has been checked as
+    ``verify_pushed`` checks it. Writing a score again overwrites it, so pushing again
+    never duplicates one.
 
     Args:
         client: The Langfuse client.
@@ -341,7 +348,8 @@ def push_run(
         item_of: Maps a case id to its dataset and item.
         outputs: What the system under test returned, by case id and trial. A trial
             missing from it has no output.
-        timeout_s: How long to wait for Langfuse to show the push.
+        timeout_s: How long to wait for Langfuse to show the push, cases and scores
+            together.
 
     Returns:
         The experiment run name, shared by every dataset's run.
@@ -363,11 +371,11 @@ def push_run(
             experiment. Pushing again raises it again; delete the item runs' traces
             first.
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
-            the run again sends them.
+            the run again sends them and writes their scores.
         PushTimeoutError: Every case appeared but some scores did not within
-            ``timeout_s``. Pushing the run again writes the missing scores, each under
-            the same id and timestamp as before, so a repeat overwrites rather than
-            adds.
+            ``timeout_s``. Pushing the run again writes those scores again under the
+            same ids and timestamps, so a score that was only slow is overwritten, not
+            duplicated.
     """
     outputs = outputs or {}
     if extra := sorted(set(outputs) - {(r.case_id, r.trial) for r in run.results}):
@@ -421,48 +429,44 @@ def push_run(
                 for case_id in sending
             ],
             outputs={case_id: case_outputs[case_id] for case_id in sending},
-            scores=expected_scores,
         )
 
     dataset_of = {case_id: group.dataset for group in groups for case_id in group.items}
-    filled = 0
-    for case_id, item_run in held.items():
-        for evaluation in expected_scores[case_id]:
-            if evaluation.name not in item_run.scores:
-                client.create_score(
-                    trace_id=item_run.trace_id,
-                    name=evaluation.name,
-                    value=float(evaluation.value),
-                    data_type=_SCORE_DATA_TYPE,
-                    score_id=_score_id(
-                        run_name=run_name,
-                        dataset=dataset_of[case_id],
-                        item_id=item_run.item_id,
-                        check=evaluation.name,
-                    ),
-                    # Langfuse reads an item run's scores back only within a day of
-                    # its items, and a resent score overwrites one of the same id and
-                    # timestamp, so a repair takes the item run's own time.
-                    timestamp=item_run.start_time,
-                )
-                filled += 1
+    written = _write_scores(
+        client=client,
+        run_name=run_name,
+        item_runs=held,
+        dataset_of=dataset_of,
+        scores=expected_scores,
+    )
+    # Scores need the trace and start time of each item run sent, so wait to see them.
+    deadline = time.monotonic() + timeout_s
+    shown = held
+    if pending:
+        shown, _ = _await_visible(
+            client=client,
+            run=run,
+            run_name=run_name,
+            groups=groups,
+            input_digests=input_digests,
+            timeout_s=timeout_s,
+            cases_only=True,
+        )
+        written += _write_scores(
+            client=client,
+            run_name=run_name,
+            item_runs={case_id: shown[case_id] for case_id in pending if case_id in shown},
+            dataset_of=dataset_of,
+            scores=expected_scores,
+        )
     client.flush()
     logger.info(
-        "%s: sent %d cases, %d already in Langfuse, filled %d missing scores, over %d datasets",
+        "%s: sent %d cases, %d already in Langfuse, wrote %d scores, over %d datasets",
         run_name,
         len(pending),
         len(held),
-        filled,
+        written,
         len(groups),
-    )
-
-    shown, missing = _await_visible(
-        client=client,
-        run=run,
-        run_name=run_name,
-        groups=groups,
-        input_digests=input_digests,
-        timeout_s=timeout_s,
     )
     if never := [case_id for case_id in pending if case_id not in shown]:
         raise PushIncompleteError(
@@ -470,10 +474,20 @@ def push_run(
             f"{len(pending)} cases sent under {run_name}; push the run again to send "
             f"{never}"
         )
+
+    _, missing = _await_visible(
+        client=client,
+        run=run,
+        run_name=run_name,
+        groups=groups,
+        input_digests=input_digests,
+        timeout_s=max(0.0, deadline - time.monotonic()),
+    )
     if missing:
         raise PushTimeoutError(
             f"after {timeout_s:.0f} s Langfuse lacks, under {run_name}: {'; '.join(missing)}; "
-            "push the run again to write the missing scores"
+            "pushing the run again writes them again under the same ids, so a score that "
+            "was only slow is overwritten, not duplicated"
         )
     return run_name
 
@@ -537,8 +551,11 @@ def _await_visible(
     groups: Sequence[_DatasetCases],
     input_digests: Mapping[str, str],
     timeout_s: float,
+    cases_only: bool = False,
 ) -> tuple[dict[str, _ItemRun], list[str]]:
     """Read Langfuse back until it shows every case and score of a run, or time runs out.
+
+    With ``cases_only``, wait only for every case, not for its scores.
 
     Returns:
         The item runs Langfuse shows by case id, and a description of each case and
@@ -565,7 +582,10 @@ def _await_visible(
         _check_matches(
             held=held, digests=expected_digests, scores=expected_scores, run_name=run_name
         )
-        missing = _missing(held=held, scores=expected_scores)
+        missing = _missing(
+            held=held,
+            scores={case_id: {} for case_id in by_case} if cases_only else expected_scores,
+        )
         if not missing:
             logger.info("%s: Langfuse shows all %d cases", run_name, len(by_case))
             return held, []
@@ -634,9 +654,10 @@ def _send(
     dataset: str,
     data: list[DatasetItem],
     outputs: Mapping[str, object],
-    scores: Mapping[str, list[Evaluation]],
 ) -> None:
     """Send one item run per item of one dataset through ``run_experiment``.
+
+    It runs no evaluators: ``_write_scores`` writes every score once the item runs show.
 
     Raises:
         PushSplitError: An item run sent was not linked to the dataset run, or the item
@@ -648,9 +669,6 @@ def _send(
             raise TypeError(f"expected a DatasetItem, got {type(item).__name__}")
         return outputs[_case_id_of(item.metadata)]
 
-    def evaluate(*, metadata: object = None, **_: object) -> list[Evaluation]:
-        return scores[_case_id_of(metadata)]
-
     manifest = run.manifest
     result = client.run_experiment(
         name=manifest.suite,
@@ -658,7 +676,7 @@ def _send(
         description=f"{manifest.suite} run {manifest.run_id} at {manifest.revision}",
         data=data,
         task=task,
-        evaluators=[evaluate],
+        evaluators=[],
         max_concurrency=_PUSH_CONCURRENCY,
         metadata={
             "suite": manifest.suite,
@@ -763,6 +781,7 @@ def _read_dataset_run(
                 str(metadata[_CASE_ID_KEY]),
                 _ItemRun(
                     trace_id=item.trace_id,
+                    observation_id=item.id,
                     start_time=item.start_time,
                     item_id=item.experiment_item_id,
                     input=_parsed(item.input),
@@ -950,8 +969,48 @@ def _input_matches(value: object, digest: str) -> bool:
     return input_digest(value) == digest
 
 
+def _write_scores(
+    *,
+    client: Langfuse,
+    run_name: str,
+    item_runs: Mapping[str, _ItemRun],
+    dataset_of: Mapping[str, str],
+    scores: Mapping[str, list[Evaluation]],
+) -> int:
+    """Write each score an item run does not show yet, and return how many were written.
+
+    Every score of a push goes through here, under an id fixed by the run name, dataset,
+    item and check and with the item run's start time as its timestamp, so writing one
+    again overwrites it instead of adding a second.
+    """
+    written = 0
+    for case_id, item_run in item_runs.items():
+        for evaluation in scores[case_id]:
+            if evaluation.name in item_run.scores:
+                continue
+            client.create_score(
+                trace_id=item_run.trace_id,
+                # The observation Langfuse reads an item run's scores back by.
+                observation_id=item_run.observation_id,
+                name=evaluation.name,
+                value=float(evaluation.value),
+                data_type=_SCORE_DATA_TYPE,
+                score_id=_score_id(
+                    run_name=run_name,
+                    dataset=dataset_of[case_id],
+                    item_id=item_run.item_id,
+                    check=evaluation.name,
+                ),
+                # Langfuse reads an item run's scores back only within a day of its
+                # items, and a resent score overwrites one of the same id and timestamp.
+                timestamp=item_run.start_time,
+            )
+            written += 1
+    return written
+
+
 def _score_id(*, run_name: str, dataset: str, item_id: str, check: str) -> str:
-    """The id of a repaired score, the same each time it is written."""
+    """The id of a score, the same each time it is written."""
     return str(uuid.uuid5(_SCORE_ID_NAMESPACE, json.dumps([run_name, dataset, item_id, check])))
 
 
