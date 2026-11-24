@@ -11,7 +11,7 @@ Scoring rules, applied to each trial in this order:
    trial passes when no check is FAIL and at least one check is PASS.
 
 A case with any excluded trial is left out of the per-case reliability counts, since
-  its remaining trials cannot show whether it passes every time.
+its remaining trials cannot show whether it passes every time.
 """
 
 from collections import Counter, defaultdict

@@ -113,6 +113,21 @@ class CaseResult(BaseModel):
             raise ValueError(f"duplicate check names: {duplicates}")
         return checks
 
+    @field_validator("checks")
+    @classmethod
+    def _task_check_alone(cls, checks: tuple[CheckResult, ...]) -> tuple[CheckResult, ...]:
+        """Reject a ``task`` check beside other checks.
+
+        The name marks a task that raised, whose trial holds that one check, and scoring
+        fails any trial that carries it.
+        """
+        if len(checks) > 1 and any(check.name == TASK_CHECK_NAME for check in checks):
+            raise ValueError(
+                f"check name {TASK_CHECK_NAME!r} is reserved for a task that raised and "
+                "must be the trial's only check"
+            )
+        return checks
+
 
 class RunManifest(BaseModel):
     """Metadata describing one run of one suite.

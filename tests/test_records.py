@@ -125,6 +125,16 @@ def test_an_empty_check_name_is_rejected() -> None:
         CheckResult(name="", verdict=Verdict.PASS)
 
 
+def test_a_task_check_beside_other_checks_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reserved for a task that raised"):
+        make_case(
+            checks=(
+                CheckResult(name="answer", verdict=Verdict.PASS),
+                CheckResult(name="task", verdict=Verdict.FAIL),
+            )
+        )
+
+
 def test_duplicate_case_and_trial_pairs_are_rejected() -> None:
     with pytest.raises(ValidationError, match="duplicate"):
         Run(manifest=make_manifest(), results=(make_case(), make_case()))

@@ -109,6 +109,17 @@ def test_a_label_that_is_not_a_verdict_raises_naming_case_and_evaluator():
         run_from_report(report=report, manifest=MANIFEST)
 
 
+def task(ctx: EvaluatorContext[Any, int, Any]) -> bool:
+    return False
+
+
+def test_an_evaluator_named_task_raises_because_the_name_is_reserved():
+    report = evaluate([Case(name="case-a", inputs={"x": 1})], task, is_even)
+
+    with pytest.raises(ValueError, match=r"case 'case-a'.*'task' is reserved"):
+        run_from_report(report=report, manifest=MANIFEST)
+
+
 def test_a_numeric_score_raises():
     report = evaluate([Case(name="case-a", inputs={"x": 1})], closeness)
 

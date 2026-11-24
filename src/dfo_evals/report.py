@@ -90,8 +90,8 @@ def run_from_report(
         The run, with results ordered by case id then trial.
 
     Raises:
-        ValueError: The report holds output from report-level evaluators, a case has no
-            name, a case and trial appear twice, a label is not a verdict, or an
+        ValueError: The report holds output from report-level evaluators, an evaluator
+            is named ``task``, a case has no name, a case and trial appear twice, a label is not a verdict, or an
             evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
@@ -159,6 +159,11 @@ def _result_from_case(
         CheckResult(name=failure.name, verdict=Verdict.UNVERIFIABLE, detail=failure.error_message)
         for failure in case.evaluator_failures
     )
+    if any(check.name == TASK_CHECK_NAME for check in checks):
+        raise ValueError(
+            f"case {case.name!r}: evaluator name {TASK_CHECK_NAME!r} is reserved for a task "
+            "that raised; rename the evaluator"
+        )
 
     return CaseResult(
         case_id=case_id,
