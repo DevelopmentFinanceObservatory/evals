@@ -1,39 +1,63 @@
 name: CI
 
 on:
+  # A push runs on dev only. main moves through pull requests from dev, whose
+  # own runs tested the merge, so a push there runs nothing.
   push:
-    branches: [main]
+    branches: [dev]
   pull_request:
-    branches: [main]
-    # `edited` catches a stacked PR's base retargeting, which emits only that
-    # event. Without it, required checks would hang on "Expected".
+    # The globs cover every branch-type prefix this repository uses, because
+    # stacked PRs take sibling branches as bases and this filter matches the
+    # base, not the head. A PR whose base matches nothing here reports no
+    # checks at all, which reads as "not yet run" rather than as a failure.
+    branches:
+      [
+        dev,
+        main,
+        "feat/**",
+        "fix/**",
+        "perf/**",
+        "refactor/**",
+        "test/**",
+        "docs/**",
+        "build/**",
+        "ci/**",
+        "chore/**",
+      ]
+    # `edited` is left out on purpose. It would start a run on every title or
+    # body edit, and the concurrency group below would cancel the real suite
+    # that the edit interrupted. The cost is that a stacked PR whose base is
+    # retargeted emits only `edited`, so its required checks wait on "Expected"
+    # until someone re-runs them.
     # `ready_for_review` starts the run when a draft is marked ready; the jobs
     # skip while the pull request is a draft.
-    types: [opened, synchronize, reopened, edited, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Keyed on the PR number for pull_request events, so a PR run never shares a
+  # group with its base branch's push runs.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# `just check` covers the lint and test jobs below -- keep the two in sync if
+# `just check` covers the lint and test jobs below. Keep the two in sync if
 # either changes.
 jobs:
   lint:
-    # `edited` fires on closed PRs too; closed PRs need no checks.
-    if: >-
-      github.event.pull_request.draft != true &&
-      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    # Runs ruff and ty together, so the single `lint` check fails on a type
+    # error too.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       UV_FROZEN: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -44,20 +68,21 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --python 3.12
 
-      - name: ruff check
+      - name: Ruff check
         run: uv run ruff check .
 
-      - name: ruff format check
+      - name: Ruff format check
         run: uv run ruff format --check .
 
-      - name: ty check
+      - name: Type check
         run: uv run ty check
 
   test:
-    if: >-
-      github.event.pull_request.draft != true &&
-      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    # Component suites run on 3.12 (apis) and 3.13 (ai), so the library tests
+    # on both. The checks report as `test (3.12)` and `test (3.13)`.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       UV_FROZEN: "1"
     strategy:
@@ -65,10 +90,10 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -85,15 +110,14 @@ jobs:
   # Consumers pin their own pydantic-ai-slim (ai is on 2.66), and each pydantic-evals
   # release pins pydantic-ai-slim exactly, so the declared lower bounds must work.
   test-lowest:
-    if: >-
-      github.event.pull_request.draft != true &&
-      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Set up Python 3.12
         run: uv python install 3.12
