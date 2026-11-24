@@ -18,8 +18,6 @@ from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManif
 
 DIGEST_PREFIX: Final = "sha256:"
 TASK_CHECK_NAME: Final = "task"
-# A task failure has no recorded duration.
-_UNKNOWN_DURATION_S: Final = 0.0
 _SINGLE_TRIAL: Final = 1
 _VERDICT_VALUES: Final = frozenset(item.value for item in Verdict)
 
@@ -27,6 +25,7 @@ type AnyReportCase = ReportCase[Any, Any, Any]
 type AnyReportCaseFailure = ReportCaseFailure[Any, Any, Any]
 # Failures carry the same inputs and metadata, so tags can be derived for both.
 type TagsOf = Callable[[AnyReportCase | AnyReportCaseFailure], tuple[str, ...]]
+type FaultOf = Callable[[AnyReportCase | AnyReportCaseFailure], FaultClass | None]
 
 
 def input_digest(inputs: object) -> str:
@@ -60,18 +59,25 @@ def run_from_report(
     report: EvaluationReport[Any, Any, Any],
     manifest: RunManifest,
     tags_of: TagsOf | None = None,
+    fault_of: FaultOf | None = None,
 ) -> Run:
     """Convert an evaluation report into a run with one result per case and trial.
 
     Labels become their verdicts, assertions become pass or fail, and an evaluator that
-    raised becomes ``unverifiable`` with the case marked as a grader fault. A task that
-    raised becomes one ``task`` check that fails; its fault is left for the caller.
+    raised becomes ``unverifiable`` and a task that raised becomes one ``task`` check that
+    fails, with no duration.
+
+    A case's fault is what ``fault_of`` returns for it. When ``fault_of`` is None or
+    returns None, a case with an evaluator that raised is a grader fault and any other
+    case has no fault.
 
     Args:
         report: The report ``Dataset.evaluate`` returned.
         manifest: Metadata of the run that produced the report.
         tags_of: Derives a case's tags from its report case or task failure. None
             gives every case no tags.
+        fault_of: Classifies who is at fault for a case or task failure, such as
+            ``INFRA`` for a timeout.
 
     Returns:
         The run, with results ordered by case id then trial.
@@ -82,8 +88,11 @@ def run_from_report(
             evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
-    results = [_result_from_case(case, tags_of=tags_of) for case in report.cases]
-    results += [_result_from_failure(failure, tags_of=tags_of) for failure in report.failures]
+    results = [_result_from_case(case, tags_of=tags_of, fault_of=fault_of) for case in report.cases]
+    results += [
+        _result_from_failure(failure, tags_of=tags_of, fault_of=fault_of)
+        for failure in report.failures
+    ]
 
     seen: set[tuple[str, int]] = set()
     for result in results:
@@ -112,7 +121,9 @@ def _reject_report_evaluator_output(report: EvaluationReport[Any, Any, Any]) -> 
         )
 
 
-def _result_from_case(case: AnyReportCase, *, tags_of: TagsOf | None) -> CaseResult:
+def _result_from_case(
+    case: AnyReportCase, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+) -> CaseResult:
     """Convert one successful report case into a case result."""
     case_id, trial = _case_id_and_trial(name=case.name, source_case_name=case.source_case_name)
     if case.scores:
@@ -147,7 +158,11 @@ def _result_from_case(case: AnyReportCase, *, tags_of: TagsOf | None) -> CaseRes
         trial=trial,
         input_digest=input_digest(case.inputs),
         checks=tuple(checks),
-        fault=FaultClass.GRADER if case.evaluator_failures else None,
+        fault=_fault(
+            case,
+            fault_of=fault_of,
+            default=FaultClass.GRADER if case.evaluator_failures else None,
+        ),
         duration_s=case.task_duration,
         cost_usd=None,
         trace_id=case.trace_id,
@@ -155,7 +170,9 @@ def _result_from_case(case: AnyReportCase, *, tags_of: TagsOf | None) -> CaseRes
     )
 
 
-def _result_from_failure(failure: AnyReportCaseFailure, *, tags_of: TagsOf | None) -> CaseResult:
+def _result_from_failure(
+    failure: AnyReportCaseFailure, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+) -> CaseResult:
     """Convert a task that raised into a case result with one failing ``task`` check."""
     case_id, trial = _case_id_and_trial(
         name=failure.name, source_case_name=failure.source_case_name
@@ -167,12 +184,23 @@ def _result_from_failure(failure: AnyReportCaseFailure, *, tags_of: TagsOf | Non
         checks=(
             CheckResult(name=TASK_CHECK_NAME, verdict=Verdict.FAIL, detail=failure.error_message),
         ),
-        fault=None,
-        duration_s=_UNKNOWN_DURATION_S,
+        fault=_fault(failure, fault_of=fault_of, default=None),
+        duration_s=None,
         cost_usd=None,
         trace_id=failure.trace_id,
         tags=tags_of(failure) if tags_of is not None else (),
     )
+
+
+def _fault(
+    item: AnyReportCase | AnyReportCaseFailure,
+    *,
+    fault_of: FaultOf | None,
+    default: FaultClass | None,
+) -> FaultClass | None:
+    """Return the caller's fault for a case, or the default when it gives none."""
+    fault = fault_of(item) if fault_of is not None else None
+    return fault if fault is not None else default
 
 
 def _case_id_and_trial(*, name: str, source_case_name: str | None) -> tuple[str, int]:

@@ -132,9 +132,33 @@ def test_a_task_that_raises_becomes_a_failing_task_check():
     assert check.name == TASK_CHECK_NAME
     assert check.verdict is Verdict.FAIL
     assert check.detail == "RuntimeError: negative input"
-    assert result.duration_s == 0
+    assert result.duration_s is None
     assert result.fault is None
     assert result.input_digest == input_digest({"x": -1})
+
+
+def test_fault_of_classifies_a_task_that_raised():
+    report = evaluate([Case(name="a", inputs={"x": -1})], is_even)
+
+    (result,) = run_from_report(
+        report=report, manifest=MANIFEST, fault_of=lambda _: FaultClass.INFRA
+    ).results
+
+    assert result.fault is FaultClass.INFRA
+
+
+def test_fault_of_overrides_the_grader_default_only_when_it_returns_a_fault():
+    report = evaluate([Case(name="a", inputs={"x": 1})], crashes, is_even)
+
+    (overridden,) = run_from_report(
+        report=report, manifest=MANIFEST, fault_of=lambda _: FaultClass.REFERENCE
+    ).results
+    (defaulted,) = run_from_report(
+        report=report, manifest=MANIFEST, fault_of=lambda _: None
+    ).results
+
+    assert overridden.fault is FaultClass.REFERENCE
+    assert defaulted.fault is FaultClass.GRADER
 
 
 def test_successful_case_records_inputs_digest_duration_and_no_cost():
