@@ -2,8 +2,12 @@
 
 A suite keeps its cases as Langfuse dataset items (``upsert_items``), then pushes each
 run as one experiment over them (``push_run``) and reads it back (``verify_pushed``).
-Langfuse runs nothing: the experiment's task returns the output the run already holds
-and its evaluator returns the scores the run's verdicts already give.
+The caller maps each case to its dataset and item (``DatasetItemRef``), so one run may
+span several datasets, as a suite that keeps one dataset per corpus file does. The run
+then lands as one dataset run in each of those datasets, all under the same run name,
+so every dataset keeps its own item ids and run history. Langfuse runs nothing: the
+experiment's task returns the output the run already holds and its evaluator returns
+the scores the run's verdicts already give.
 
 Langfuse shows one item run per dataset item in an experiment, so a case has one item
 run however many trials it ran. Its output holds every trial's result (and the caller's
@@ -16,7 +20,8 @@ trace id are in the item run's metadata under ``trials``.
 
 The experiment is named ``<suite>/<run_id> <revision> <digest>``, where ``<digest>``
 begins the digest of the run's records and outputs. Pushing the same run again sends
-only the cases and scores Langfuse lacks; a different run never shares a name.
+only the cases and scores Langfuse lacks in each dataset; a different run never shares
+a name.
 
 Every digest here is taken after whole-number floats become integers, so a store that
 returns ``1.0`` as ``1`` still matches. Langfuse Cloud returned outputs verbatim on
@@ -26,9 +31,9 @@ langfuse's ``run_experiment`` (4.14 to 4.18) takes each experiment's id from
 ``dataset_run_items.create``, an endpoint the SDK marks for removal from Langfuse Cloud
 on 16 November 2026. It still answered on 24 November 2026. Once it goes, the SDK logs
 "Failed to create dataset run item" for each item and falls back to one random
-experiment id per ``run_experiment`` call: one push still lands as one experiment, but a
-re-push that sends missing cases lands under a second experiment id with the same run
-name. Reading back by experiment name sees both.
+experiment id per ``run_experiment`` call: one push still lands as one experiment per
+dataset, but a re-push that sends missing cases lands under a second experiment id with
+the same run name. Reading back by experiment name and dataset sees both.
 """
 
 import json
@@ -85,7 +90,7 @@ class WrongProjectError(LangfuseSinkError):
 
 
 class UnknownCaseError(LangfuseSinkError):
-    """The run holds a case with no item in the dataset it is pushed to."""
+    """The run holds a case with no item in the dataset it maps to."""
 
 
 class PushMismatchError(LangfuseSinkError):
@@ -115,6 +120,36 @@ class DatasetItemSpec:
     input: object
     expected_output: object = None
     metadata: object = None
+
+
+@dataclass(frozen=True)
+class DatasetItemRef:
+    """Where a case lives in Langfuse.
+
+    Attributes:
+        dataset: Name of the dataset holding the case.
+        item_id: The case's dataset item id.
+    """
+
+    dataset: str
+    item_id: str
+
+
+@dataclass(frozen=True)
+class _HeldDataset:
+    """A dataset as Langfuse holds it."""
+
+    dataset_id: str
+    items: Mapping[str, DatasetItem]
+
+
+@dataclass(frozen=True)
+class _DatasetCases:
+    """The run's cases that one dataset holds, each with its item."""
+
+    dataset: str
+    dataset_id: str
+    items: Mapping[str, DatasetItem]
 
 
 @dataclass(frozen=True)
@@ -205,7 +240,8 @@ def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemS
     if no_input := [item.item_id for item in items if item.input is None]:
         raise ValueError(f"dataset {dataset!r}: items have no input: {no_input}")
 
-    held = _held_items(client=client, dataset=dataset, create=True)
+    held = _held_dataset(client=client, dataset=dataset, create=True)
+    held_items = held.items if held else {}
     written = []
     for spec in items:
         input_, expected_output, metadata = (
@@ -213,7 +249,7 @@ def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemS
             to_jsonable_python(spec.expected_output),
             to_jsonable_python(spec.metadata),
         )
-        item = held.get(spec.item_id)
+        item = held_items.get(spec.item_id)
         if (
             item is not None
             and item.status == DatasetStatus.ACTIVE
@@ -238,36 +274,37 @@ def push_run(
     *,
     client: Langfuse,
     run: Run,
-    dataset: str,
-    item_id_of: Callable[[str], str],
+    item_of: Callable[[str], DatasetItemRef],
     outputs: Mapping[tuple[str, int], object] | None = None,
     timeout_s: float = VERIFY_TIMEOUT_S,
 ) -> str:
-    """Push a run as one experiment over a dataset, sending only what Langfuse lacks.
+    """Push a run as one experiment, sending only what Langfuse lacks.
 
-    Every case of the run must already be an item of the dataset (``upsert_items``).
-    After sending, Langfuse is read back until it shows every case and score, so a
-    push that returns has been checked as ``verify_pushed`` checks it.
+    Every case of the run must already be an item of the dataset ``item_of`` maps it to
+    (``upsert_items``). The run lands as one dataset run in each dataset its cases map
+    to, all under one run name. After sending, Langfuse is read back until it shows
+    every case and score, so a push that returns has been checked as ``verify_pushed``
+    checks it.
 
     Args:
         client: The Langfuse client.
         run: The run to push.
-        dataset: Name of the dataset holding the run's cases.
-        item_id_of: Maps a case id to its dataset item id.
+        item_of: Maps a case id to its dataset and item.
         outputs: What the system under test returned, by case id and trial. A trial
             missing from it has no output.
         timeout_s: How long to wait for Langfuse to show the push.
 
     Returns:
-        The experiment run name.
+        The experiment run name, shared by every dataset's run.
 
     Raises:
-        UnknownCaseError: A case has no item in the dataset. Nothing is written.
-        ValueError: ``outputs`` names a case and trial the run lacks, the revision holds
-            a comma, a case scores more checks than Langfuse reads back, or a dataset
-            item has no input. Nothing is written.
+        UnknownCaseError: A case has no item in the dataset it maps to. Nothing is
+            written.
+        ValueError: ``outputs`` names a case and trial the run lacks, two cases map to
+            one item, the revision holds a comma, a case scores more checks than
+            Langfuse reads back, or a dataset item has no input. Nothing is written.
         PushMismatchError: Langfuse holds a case under this experiment that differs from
-            the run's.
+            the run's, or holds it in a dataset the case does not map to.
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
             the run again sends them.
         PushTimeoutError: Every case appeared but some scores did not within
@@ -278,12 +315,10 @@ def push_run(
         raise ValueError(f"outputs name case trials the run lacks: {extra}")
 
     by_case = _results_by_case(run)
-    held_items = _held_items(client=client, dataset=dataset, create=False)
-    item_ids = {case_id: item_id_of(case_id) for case_id in by_case}
-    if unknown := [case_id for case_id, item_id in item_ids.items() if item_id not in held_items]:
-        raise UnknownCaseError(f"dataset {dataset!r} holds no item for cases {unknown}")
-    if no_input := [i for i in item_ids.values() if held_items[i].input is None]:
-        raise ValueError(f"dataset {dataset!r}: items have no input: {no_input}")
+    groups = _group_cases(client=client, case_ids=list(by_case), item_of=item_of)
+    for group in groups:
+        if no_input := [item.id for item in group.items.values() if item.input is None]:
+            raise ValueError(f"dataset {group.dataset!r}: items have no input: {no_input}")
     expected_scores = {case_id: case_scores(results) for case_id, results in by_case.items()}
     if over := [c for c, scores in expected_scores.items() if len(scores) > _MAX_SCORES]:
         raise ValueError(
@@ -295,9 +330,9 @@ def push_run(
         case_id: _case_output(case_id, results, outputs) for case_id, results in by_case.items()
     }
 
-    held = _read_pushed(client=client, run=run, run_name=run_name)
+    held = _read_pushed(client=client, run=run, run_name=run_name, groups=groups)
     for case_id, item_run in held.items():
-        if case_id not in by_case or item_run.case_digest != _case_digest(by_case[case_id]):
+        if item_run.case_digest != _case_digest(by_case[case_id]):
             raise PushMismatchError(
                 f"Langfuse holds case {case_id!r} under {run_name} with results the run lacks"
             )
@@ -307,18 +342,21 @@ def push_run(
             )
 
     pending = [case_id for case_id in by_case if case_id not in held]
-    if pending:
+    for group in groups:
+        if not (sending := [case_id for case_id in group.items if case_id not in held]):
+            continue
+        # One run_experiment per dataset, so each dataset holds its own dataset run.
         _send(
             client=client,
             run=run,
             run_name=run_name,
             data=[
-                held_items[item_ids[case_id]].model_copy(
+                group.items[case_id].model_copy(
                     update={"metadata": _item_run_metadata(by_case[case_id], case_outputs[case_id])}
                 )
-                for case_id in pending
+                for case_id in sending
             ],
-            outputs={case_id: case_outputs[case_id] for case_id in pending},
+            outputs={case_id: case_outputs[case_id] for case_id in sending},
             scores=expected_scores,
         )
 
@@ -335,14 +373,17 @@ def push_run(
                 filled += 1
     client.flush()
     logger.info(
-        "%s: sent %d cases, %d already in Langfuse, filled %d missing scores",
+        "%s: sent %d cases, %d already in Langfuse, filled %d missing scores, over %d datasets",
         run_name,
         len(pending),
         len(held),
         filled,
+        len(groups),
     )
 
-    shown, missing = _await_visible(client=client, run=run, run_name=run_name, timeout_s=timeout_s)
+    shown, missing = _await_visible(
+        client=client, run=run, run_name=run_name, groups=groups, timeout_s=timeout_s
+    )
     if never := [case_id for case_id in pending if case_id not in shown]:
         raise PushIncompleteError(
             f"after {timeout_s:.0f} s Langfuse shows {len(pending) - len(never)} of the "
@@ -358,21 +399,35 @@ def push_run(
 
 
 def verify_pushed(
-    *, client: Langfuse, run: Run, run_name: str, timeout_s: float = VERIFY_TIMEOUT_S
+    *,
+    client: Langfuse,
+    run: Run,
+    run_name: str,
+    item_of: Callable[[str], DatasetItemRef],
+    timeout_s: float = VERIFY_TIMEOUT_S,
 ) -> None:
     """Wait until Langfuse shows every case and score of a pushed run, and check them.
+
+    Each dataset the run's cases map to is read back under ``run_name``.
 
     Args:
         client: The Langfuse client.
         run: The run that was pushed.
         run_name: The experiment run name ``push_run`` returned.
+        item_of: Maps a case id to its dataset and item, as given to ``push_run``.
         timeout_s: How long to wait for Langfuse to show the whole push.
 
     Raises:
-        PushMismatchError: Langfuse shows a case or score that differs from the run.
+        UnknownCaseError: A case has no item in the dataset it maps to.
+        ValueError: Two cases map to one item.
+        PushMismatchError: Langfuse shows a case or score that differs from the run, or
+            shows a case in a dataset it does not map to.
         PushTimeoutError: Langfuse still lacks a case or score after ``timeout_s``.
     """
-    _, missing = _await_visible(client=client, run=run, run_name=run_name, timeout_s=timeout_s)
+    groups = _group_cases(client=client, case_ids=list(_results_by_case(run)), item_of=item_of)
+    _, missing = _await_visible(
+        client=client, run=run, run_name=run_name, groups=groups, timeout_s=timeout_s
+    )
     if missing:
         # No re-push hint: a slow Langfuse would get the same cases and scores twice.
         raise PushTimeoutError(
@@ -381,7 +436,12 @@ def verify_pushed(
 
 
 def _await_visible(
-    *, client: Langfuse, run: Run, run_name: str, timeout_s: float
+    *,
+    client: Langfuse,
+    run: Run,
+    run_name: str,
+    groups: Sequence[_DatasetCases],
+    timeout_s: float,
 ) -> tuple[dict[str, _ItemRun], list[str]]:
     """Read Langfuse back until it shows every case and score of a run, or time runs out.
 
@@ -390,7 +450,8 @@ def _await_visible(
         score it still lacks, empty when it shows everything.
 
     Raises:
-        PushMismatchError: Langfuse shows a case or score that differs from the run.
+        PushMismatchError: Langfuse shows a case or score that differs from the run, or
+            a case in a dataset it does not map to.
     """
     by_case = _results_by_case(run)
     expected_digests = {case_id: _case_digest(results) for case_id, results in by_case.items()}
@@ -401,7 +462,7 @@ def _await_visible(
 
     deadline = time.monotonic() + timeout_s
     while True:
-        held = _read_pushed(client=client, run=run, run_name=run_name)
+        held = _read_pushed(client=client, run=run, run_name=run_name, groups=groups)
         _check_matches(
             held=held, digests=expected_digests, scores=expected_scores, run_name=run_name
         )
@@ -512,8 +573,33 @@ def _send(
         )
 
 
-def _read_pushed(*, client: Langfuse, run: Run, run_name: str) -> dict[str, _ItemRun]:
-    """Read the item runs Langfuse shows under an experiment, by case id, newest first.
+def _read_pushed(
+    *, client: Langfuse, run: Run, run_name: str, groups: Sequence[_DatasetCases]
+) -> dict[str, _ItemRun]:
+    """Read the item runs Langfuse shows under an experiment in each dataset, by case id.
+
+    Raises:
+        PushMismatchError: An item run lacks the metadata a push writes, or is of a case
+            the run does not map to its dataset.
+    """
+    found: dict[str, _ItemRun] = {}
+    for group in groups:
+        shown = _read_dataset_run(
+            client=client, run=run, run_name=run_name, dataset_id=group.dataset_id
+        )
+        if stray := sorted(set(shown) - set(group.items)):
+            raise PushMismatchError(
+                f"Langfuse shows cases {stray} under {run_name} in dataset "
+                f"{group.dataset!r}, which the run does not map there"
+            )
+        found |= shown
+    return found
+
+
+def _read_dataset_run(
+    *, client: Langfuse, run: Run, run_name: str, dataset_id: str
+) -> dict[str, _ItemRun]:
+    """Read the item runs Langfuse shows under an experiment in one dataset, newest first.
 
     Raises:
         PushMismatchError: An item run lacks the metadata a push writes.
@@ -525,6 +611,7 @@ def _read_pushed(*, client: Langfuse, run: Run, run_name: str) -> dict[str, _Ite
             # No item run of this run's push can start before the run did.
             from_start_time=run.manifest.started_at,
             experiment_name=run_name,
+            dataset_id=dataset_id,
             fields=_READ_FIELDS,
             limit=_PAGE_SIZE,
             score_limit=_MAX_SCORES,
@@ -566,12 +653,9 @@ def _check_matches(
     """Raise if anything Langfuse shows differs from the run.
 
     Raises:
-        PushMismatchError: A case is not in the run, its records or output differ, or a
-            score has another value.
+        PushMismatchError: A case's records or output differ, or a score has another value.
     """
     for case_id, item_run in held.items():
-        if case_id not in digests:
-            raise PushMismatchError(f"Langfuse shows case {case_id!r} under {run_name}, not in run")
         if item_run.case_digest != digests[case_id]:
             raise PushMismatchError(f"case {case_id!r} under {run_name}: records differ")
         output = item_run.output
@@ -600,15 +684,59 @@ def _missing(
     return missing
 
 
-def _held_items(*, client: Langfuse, dataset: str, create: bool) -> dict[str, DatasetItem]:
-    """Return a dataset's items by id; a missing dataset is created or read as empty."""
+def _held_dataset(*, client: Langfuse, dataset: str, create: bool) -> _HeldDataset | None:
+    """Return a dataset's id and items by id, or None when it is missing.
+
+    A missing dataset is created first when ``create`` is set, and then read as empty.
+    """
     try:
-        return {item.id: item for item in client.get_dataset(dataset).items}
+        held = client.get_dataset(dataset)
     except NotFoundError:
         if create:
             client.create_dataset(name=dataset)
             logger.info("created dataset %s", dataset)
-        return {}
+        return None
+    return _HeldDataset(dataset_id=held.id, items={item.id: item for item in held.items})
+
+
+def _group_cases(
+    *, client: Langfuse, case_ids: Sequence[str], item_of: Callable[[str], DatasetItemRef]
+) -> list[_DatasetCases]:
+    """Group cases by the dataset ``item_of`` maps them to, each with its held item.
+
+    Raises:
+        ValueError: Two cases map to one item.
+        UnknownCaseError: A case has no item in the dataset it maps to.
+    """
+    refs = {case_id: item_of(case_id) for case_id in case_ids}
+    if len(set(refs.values())) != len(refs):
+        raise ValueError(f"cases map to the same dataset item: {refs}")
+    by_dataset: defaultdict[str, dict[str, str]] = defaultdict(dict)
+    for case_id, ref in refs.items():
+        by_dataset[ref.dataset][case_id] = ref.item_id
+
+    groups = []
+    unknown = []
+    for dataset, item_ids in sorted(by_dataset.items()):
+        held = _held_dataset(client=client, dataset=dataset, create=False)
+        lacking = [
+            case_id
+            for case_id, item_id in item_ids.items()
+            if held is None or item_id not in held.items
+        ]
+        if held is None or lacking:
+            unknown.append(f"dataset {dataset!r} holds no item for cases {lacking}")
+            continue
+        groups.append(
+            _DatasetCases(
+                dataset=dataset,
+                dataset_id=held.dataset_id,
+                items={case_id: held.items[item_id] for case_id, item_id in item_ids.items()},
+            )
+        )
+    if unknown:
+        raise UnknownCaseError("; ".join(unknown))
+    return groups
 
 
 def _results_by_case(run: Run) -> dict[str, list[CaseResult]]:

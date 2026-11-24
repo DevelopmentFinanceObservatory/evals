@@ -7,6 +7,7 @@ import pytest
 from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
 
 from dfo_evals.langfuse_sink import (
+    DatasetItemRef,
     DatasetItemSpec,
     PushIncompleteError,
     PushMismatchError,
@@ -23,6 +24,7 @@ from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManif
 
 _PROJECT = "project-1"
 _DATASET = "search-core"
+_OTHER_DATASET = "search-extra"
 _STARTED = datetime.datetime(2026, 11, 1, tzinfo=datetime.UTC)
 _PAGE = 2
 
@@ -32,8 +34,9 @@ class _FakeLangfuse:
 
     `run_experiment` runs the task and evaluators on each item as the SDK does and keeps one
     item run per item, its metadata the experiment's and the item's with every value a
-    string. `api.experiments.list_items` reads item runs back newest first, `_PAGE` to a
-    page, with whole-number floats in outputs written as ints, as JavaScript writes JSON.
+    string, and records each `run_experiment` call's datasets in `experiments`.
+    `api.experiments.list_items` reads one experiment's item runs back newest first, in one
+    dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs written as ints, as JavaScript writes JSON.
     The next push loses its first `drop_runs` item runs, and the scores of the next
     `drop_scores`, as a failed send would. `hide_scores` keeps scores from reading back,
     and the next `hidden_reads` reads show nothing, as before Langfuse shows a push.
@@ -44,6 +47,7 @@ class _FakeLangfuse:
         self.items: dict[str, DatasetItem] = {}
         self.item_writes: list[str] = []
         self.runs: list[dict[str, Any]] = []
+        self.experiments: list[tuple[str, set[str]]] = []
         self.drop_runs = 0
         self.drop_scores = 0
         self.hide_scores = False
@@ -61,7 +65,8 @@ class _FakeLangfuse:
             raise NotFoundError(body=name)
         dataset_id = self.datasets[name]
         return SimpleNamespace(
-            items=[item for item in self.items.values() if item.dataset_id == dataset_id]
+            id=dataset_id,
+            items=[item for item in self.items.values() if item.dataset_id == dataset_id],
         )
 
     def create_dataset(self, *, name: str) -> None:
@@ -102,6 +107,7 @@ class _FakeLangfuse:
         metadata: dict[str, str],
         **_: Any,
     ) -> Any:
+        self.experiments.append((run_name, {item.dataset_name for item in data}))
         results = []
         for item in data:
             output = task(item=item)
@@ -126,6 +132,7 @@ class _FakeLangfuse:
                 {
                     "experiment": run_name,
                     "item": item.id,
+                    "dataset_id": item.dataset_id,
                     "trace_id": f"trace-{len(self.runs)}",
                     "output": json.dumps(output),
                     "metadata": {
@@ -152,6 +159,7 @@ class _FakeLangfuse:
         experiment_name: str,
         score_limit: int,
         cursor: str | None,
+        dataset_id: str | None = None,
         **_: Any,
     ) -> Any:
         assert from_start_time == _STARTED
@@ -159,7 +167,11 @@ class _FakeLangfuse:
         if self.hidden_reads:
             self.hidden_reads -= 1
             return SimpleNamespace(data=[], meta=SimpleNamespace(cursor=None))
-        shown = [run for run in reversed(self.runs) if run["experiment"] == experiment_name]
+        shown = [
+            run
+            for run in reversed(self.runs)
+            if run["experiment"] == experiment_name and dataset_id in (None, run["dataset_id"])
+        ]
         start = int(cursor or 0)
         return SimpleNamespace(
             data=[
@@ -228,39 +240,43 @@ def _run(*results: CaseResult, run_id: str = "20261101T000000Z") -> Run:
     )
 
 
-def _item_id(case_id: str) -> str:
-    return f"{_DATASET}:search-case-{case_id}"
+def _item_id(case_id: str, dataset: str = _DATASET) -> str:
+    return f"{dataset}:search-case-{case_id}"
+
+
+def _item(case_id: str) -> DatasetItemRef:
+    return DatasetItemRef(dataset=_DATASET, item_id=_item_id(case_id))
+
+
+def _split_item(case_id: str) -> DatasetItemRef:
+    """Case "a" in `_DATASET`, every other case in `_OTHER_DATASET`."""
+    dataset = _DATASET if case_id == "a" else _OTHER_DATASET
+    return DatasetItemRef(dataset=dataset, item_id=_item_id(case_id, dataset))
+
+
+def _add_items(fake: _FakeLangfuse, *case_ids: str, dataset: str = _DATASET) -> None:
+    upsert_items(
+        client=fake,
+        dataset=dataset,
+        items=[DatasetItemSpec(item_id=_item_id(c, dataset), input={"q": c}) for c in case_ids],
+    )
+    fake.item_writes.clear()
 
 
 def _with_items(*case_ids: str) -> _FakeLangfuse:
     fake = _FakeLangfuse()
-    upsert_items(
-        client=fake,
-        dataset=_DATASET,
-        items=[DatasetItemSpec(item_id=_item_id(c), input={"q": c}) for c in case_ids],
-    )
-    fake.item_writes.clear()
+    _add_items(fake, *case_ids)
     return fake
 
 
 def _push(fake: _FakeLangfuse, run: Run, *, timeout_s: float = 0, **kwargs: Any) -> str:
-    return push_run(
-        client=fake,
-        run=run,
-        dataset=_DATASET,
-        item_id_of=_item_id,
-        timeout_s=timeout_s,
-        **kwargs,
-    )
+    kwargs.setdefault("item_of", _item)
+    return push_run(client=fake, run=run, timeout_s=timeout_s, **kwargs)
 
 
 def _verify(fake: _FakeLangfuse, run: Run, name: str, **kwargs: Any) -> None:
-    verify_pushed(
-        client=fake,
-        run=run,
-        run_name=name,
-        **kwargs,
-    )
+    kwargs.setdefault("item_of", _item)
+    verify_pushed(client=fake, run=run, run_name=name, **kwargs)
 
 
 _TWO_CASES = _run(
@@ -390,6 +406,69 @@ def test_a_push_to_a_missing_dataset_raises_and_creates_nothing() -> None:
         _push(fake, _TWO_CASES)
 
     assert fake.datasets == {}
+
+
+def test_a_run_over_two_datasets_pushes_each_case_to_its_own_dataset_under_one_name() -> None:
+    fake = _with_items("a")
+    _add_items(fake, "b", dataset=_OTHER_DATASET)
+
+    name = _push(fake, _TWO_CASES, item_of=_split_item)
+
+    (a,) = fake.runs_of("a")
+    (b,) = fake.runs_of("b")
+    assert (a["item"], a["dataset_id"]) == (_item_id("a"), fake.datasets[_DATASET])
+    assert (b["item"], b["dataset_id"]) == (
+        _item_id("b", _OTHER_DATASET),
+        fake.datasets[_OTHER_DATASET],
+    )
+    assert fake.experiments == [(name, {_DATASET}), (name, {_OTHER_DATASET})]
+    _verify(fake, _TWO_CASES, name, item_of=_split_item, timeout_s=0)
+
+    assert _push(fake, _TWO_CASES, item_of=_split_item) == name
+    assert (len(fake.runs), len(fake.experiments)) == (2, 2)
+
+
+def test_a_case_lost_in_one_of_two_datasets_is_sent_again_to_that_dataset_only() -> None:
+    fake = _with_items("a")
+    _add_items(fake, "b", dataset=_OTHER_DATASET)
+    # The first item run sent, case "a" in _DATASET, is lost.
+    fake.drop_runs = 1
+
+    with pytest.raises(PushIncompleteError, match=r"\['a'\]"):
+        _push(fake, _TWO_CASES, item_of=_split_item)
+    name = _push(fake, _TWO_CASES, item_of=_split_item)
+
+    assert fake.experiments[2:] == [(name, {_DATASET})]
+    assert sorted(run["metadata"]["case_id"] for run in fake.runs) == ["a", "b"]
+    _verify(fake, _TWO_CASES, name, item_of=_split_item, timeout_s=0)
+
+
+def test_a_case_mapped_to_an_item_its_dataset_lacks_raises_naming_the_dataset() -> None:
+    fake = _with_items("a", "b")
+    fake.create_dataset(name=_OTHER_DATASET)
+
+    with pytest.raises(UnknownCaseError, match=rf"dataset '{_OTHER_DATASET}'.*\['b'\]"):
+        _push(fake, _TWO_CASES, item_of=_split_item)
+
+    assert (fake.runs, fake.item_writes) == ([], [])
+
+
+def test_a_case_shown_in_a_dataset_it_does_not_map_to_is_a_mismatch() -> None:
+    fake = _with_items("a", "b")
+    _add_items(fake, "b", dataset=_OTHER_DATASET)
+    name = _push(fake, _TWO_CASES)
+
+    with pytest.raises(PushMismatchError, match=rf"\['b'\].*'{_DATASET}'"):
+        _verify(fake, _TWO_CASES, name, item_of=_split_item, timeout_s=0)
+
+
+def test_two_cases_mapped_to_one_item_are_refused() -> None:
+    fake = _with_items("a", "b")
+
+    with pytest.raises(ValueError, match="same dataset item"):
+        _push(fake, _TWO_CASES, item_of=lambda _: _item("a"))
+
+    assert fake.runs == []
 
 
 def test_outputs_for_a_trial_the_run_lacks_are_refused() -> None:
