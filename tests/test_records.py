@@ -247,13 +247,13 @@ def test_a_manifest_with_another_schema_version_cannot_be_built() -> None:
         make_manifest(schema_version=2)
 
 
-@pytest.mark.parametrize("value", [float("inf"), float("nan")])
 def test_an_unknown_duration_round_trips(tmp_path: Path) -> None:
     run = Run(manifest=make_manifest(), results=(make_case(duration_s=None),))
 
     assert read_run(write_run(root=tmp_path, run=run)) == run
 
 
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
 def test_non_finite_durations_and_costs_are_rejected(value: float) -> None:
     with pytest.raises(ValidationError):
         make_case(duration_s=value)
