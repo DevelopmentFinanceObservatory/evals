@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from dfo_evals.page import (
+    CORPUS_CHANGED,
     HISTORY_LIMIT,
     MINUS_SIGN,
     NO_PREVIOUS,
@@ -53,6 +54,7 @@ def save_run(
     day: int,
     passes: dict[str, list[bool]],
     suite: str = "apis-search",
+    dataset_digest: str = "sha256:dataset",
 ) -> None:
     """Write a run on day ``day`` with one case per entry in ``passes[tag]``."""
     results = tuple(
@@ -67,7 +69,7 @@ def save_run(
         finished_at=None,
         revision=f"rev{day}",
         environment={},
-        dataset_digest="sha256:dataset",
+        dataset_digest=dataset_digest,
     )
     write_run(root=root, run=Run(manifest=manifest, results=results))
 
@@ -123,6 +125,20 @@ def test_a_group_with_no_scored_trials_shows_n_a(tmp_path: Path) -> None:
     assert second
     assert re.findall(r"<td[^>]*>(.*?)</td>", first.group(1))[-2:] == ["n/a", NO_PREVIOUS]
     assert re.findall(r"<td[^>]*>(.*?)</td>", second.group(1))[-2:] == ["100.0%", "n/a"]
+
+
+def test_a_change_of_corpus_replaces_the_change_with_a_flag(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True, False]})
+    save_run(tmp_path, day=2, passes={DAC: [True]}, dataset_digest="sha256:smaller")
+
+    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+
+    assert group_row(page, "All cases")[2] == CORPUS_CHANGED
+    assert group_row(page, DAC)[2] == CORPUS_CHANGED
+    history = page[page.index("History of") :]
+    newest_row = history[history.index("night-002") :].split("</tr>")[0]
+    assert CORPUS_CHANGED in newest_row
+    assert 'class="num up"' not in page
 
 
 def test_history_is_newest_first_and_capped(tmp_path: Path) -> None:

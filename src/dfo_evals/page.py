@@ -33,6 +33,9 @@ ALL_CASES_LABEL: Final = "All cases"
 NO_VALUE: Final = "n/a"
 # A change cell with nothing to compare against: a new group or the suite's first run.
 NO_PREVIOUS: Final = "new"
+# A change cell whose previous run scored a different set of cases (another dataset
+# digest), so a change in rate would not measure the system.
+CORPUS_CHANGED: Final = "corpus changed"
 MINUS_SIGN: Final = "\N{MINUS SIGN}"
 RANGE_SEPARATOR: Final = "\N{EN DASH}"
 DISTRIBUTION_SEPARATOR: Final = " \N{MIDDLE DOT} "
@@ -204,6 +207,7 @@ def _groups_table(*, suite: str, latest: RunSummary, previous: RunSummary | None
         ]
     headers.append("Excluded trials")
 
+    comparable = _same_corpus(latest, previous)
     rows: list[tuple[str, GroupSummary, GroupSummary | None]] = [
         (ALL_CASES_LABEL, latest.all_cases, previous.all_cases if previous else None)
     ]
@@ -217,7 +221,7 @@ def _groups_table(*, suite: str, latest: RunSummary, previous: RunSummary | None
         cells = [
             _num(str(group.scored_trials)),
             _num(format_rate(group.success_rate)),
-            _change_cell(current=group, previous=before),
+            _change_cell(current=group, previous=before, comparable=comparable),
         ]
         if latest.multi_trial:
             cells += [
@@ -240,8 +244,12 @@ def _history_table(*, suite: str, runs: Sequence[RunSummary]) -> str:
         f"<td>{escape(format_time(run.manifest.started_at))}</td>"
         f"<td><code>{escape(run.manifest.revision)}</code></td>"
         f"{_num(format_rate(run.all_cases.success_rate))}"
-        f"{_change_cell(current=run.all_cases, previous=before.all_cases if before else None)}"
-        "</tr>"
+        + _change_cell(
+            current=run.all_cases,
+            previous=before.all_cases if before else None,
+            comparable=_same_corpus(run, before),
+        )
+        + "</tr>"
         for run, before in reversed(recent)
     ]
     shown = f"last {len(recent)} runs" if len(recent) > 1 else "1 run"
@@ -273,10 +281,21 @@ def _num(text: str) -> str:
     return f'<td class="num">{escape(text)}</td>'
 
 
-def _change_cell(*, current: GroupSummary, previous: GroupSummary | None) -> str:
-    """Render a change cell; colour backs up the sign, never replaces it."""
+def _same_corpus(run: RunSummary, previous: RunSummary | None) -> bool:
+    """Whether a run scored the same cases as the run before it, by dataset digest."""
+    return previous is None or run.manifest.dataset_digest == previous.manifest.dataset_digest
+
+
+def _change_cell(*, current: GroupSummary, previous: GroupSummary | None, comparable: bool) -> str:
+    """Render a change cell; colour backs up the sign, never replaces it.
+
+    A change against a run on another corpus shows "corpus changed" with no colour,
+    since removing or adding cases moves the rate without any change in the system.
+    """
     if previous is None:
         return _num(NO_PREVIOUS)
+    if not comparable:
+        return _num(CORPUS_CHANGED)
     text = format_change(rate_change_pp(current=current, previous=previous))
     if text.startswith("+"):
         return f'<td class="num up">{escape(text)}</td>'
@@ -323,7 +342,8 @@ def _document(body: str) -> str:
             body,
             "</main>",
             "<footer><p>Success rate is passes over scored trials. Change is in percentage "
-            "points against the previous run of the same suite. Tags can overlap, so group rows "
+            "points against the previous run of the same suite, shown only when both runs scored the "
+            "same corpus. Tags can overlap, so group rows "
             "need not add up to All cases.</p></footer>",
             "</body>",
             "</html>",
