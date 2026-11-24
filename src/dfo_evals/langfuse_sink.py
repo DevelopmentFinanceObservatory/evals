@@ -25,8 +25,8 @@ failed gets no score. A score missing from an item run already in Langfuse is wr
 by ``create_score`` with an id derived from the run name, dataset, item and check, and
 the item run's start time as its timestamp: Langfuse reads an item run's scores back
 only within a day of the item runs, and a score sent again with the same id and
-timestamp overwrites the first. Each trial's number, fault, duration, cost, tags, input digest and
-trace id are in the item run's metadata under ``trials``.
+timestamp overwrites the first. Each trial's number, fault, duration, cost, tags, input
+digest and trace id are in the item run's metadata under ``trials``.
 
 The experiment is named ``<suite>/<run_id> <revision> <digest>``, where ``<digest>``
 begins the digest of the run's records and outputs. Pushing the same run again sends
@@ -47,14 +47,16 @@ removal on 16 November 2026, still answering on 24 November 2026), the SDK logs
 the one ``run_experiment`` call. A push raises ``PushSplitError`` when any item run
 it sends is not linked to the dataset run, which each item's result reports. Reading
 back by name and dataset would merge experiments, so a push or verification that finds
-one dataset's item runs under more than one experiment id raises it too. Verification
-cannot tell a dataset run from a fallback id when every item run of a dataset shares
-one: the only lookup of a dataset run by name, ``datasets.get_run``, is among the
-endpoints marked for removal.
+one dataset's item runs under more than one experiment id raises it too. It also raises
+on any item run whose experiment id has the fallback's shape, 16 lowercase hex
+characters (an OpenTelemetry span id from ``Langfuse._create_observation_id``), where a
+dataset run's id is a UUID, so a dataset whose item runs all fell back to one id never
+passes either.
 """
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -98,6 +100,9 @@ _CASE_ID_KEY: Final = "case_id"
 _CASE_DIGEST_KEY: Final = "case_digest"
 _OUTPUT_DIGEST_KEY: Final = "output_digest"
 _TRIALS_KEY: Final = "trials"
+# The shape of the experiment id the SDK falls back to when it cannot link an item run
+# to the dataset run: an OpenTelemetry span id. A dataset run's id is a UUID.
+_FALLBACK_EXPERIMENT_ID: Final = re.compile(r"^[0-9a-f]{16}$")
 # Namespace of the score ids a push writes when it repairs a missing score.
 _SCORE_ID_NAMESPACE: Final = uuid.uuid5(
     uuid.NAMESPACE_URL, "https://github.com/DevelopmentFinanceObservatory/evals/langfuse-score"
@@ -325,10 +330,10 @@ def push_run(
     (``upsert_items``), and that item's input must be the case's inputs exactly as the
     run evaluated them: its ``input_digest`` must equal the case's stored
     ``input_digest``. Item runs already in Langfuse count as pushed only when they are
-    of the mapped item in its dataset and hold that input. The run lands as one dataset run in each dataset its cases map
-    to, all under one run name. After sending, Langfuse is read back until it shows
-    every case and score, so a push that returns has been checked as ``verify_pushed``
-    checks it.
+    of the mapped item in its dataset and hold that input. The run lands as one dataset
+    run in each dataset its cases map to, all under one run name. After sending,
+    Langfuse is read back until it shows every case and score, so a push that returns
+    has been checked as ``verify_pushed`` checks it.
 
     Args:
         client: The Langfuse client.
@@ -353,9 +358,10 @@ def push_run(
         PushMismatchError: Langfuse holds a case under this experiment that differs from
             the run's, in a dataset or item the case does not map to, or on another
             input.
-        PushSplitError: An item run sent was not linked to its dataset run, or one
-            dataset's item runs, those already held or those just sent, sit in more
-            than one experiment. Pushing again does not mend it.
+        PushSplitError: An item run, sent now or held from an earlier push, was not
+            linked to its dataset run, or one dataset's item runs sit in more than one
+            experiment. Pushing again raises it again; delete the item runs' traces
+            first.
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
             the run again sends them.
         PushTimeoutError: Every case appeared but some scores did not within
@@ -500,7 +506,8 @@ def verify_pushed(
             digests.
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
             shows a case in a dataset or item it does not map to, or on another input.
-        PushSplitError: One dataset's item runs sit in more than one experiment.
+        PushSplitError: An item run was not linked to its dataset run, or one dataset's
+            item runs sit in more than one experiment.
         PushTimeoutError: Langfuse still lacks a case or score after ``timeout_s``.
     """
     by_case = _results_by_case(run)
@@ -540,7 +547,8 @@ def _await_visible(
     Raises:
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
             a case in a dataset or item it does not map to, or on another input.
-        PushSplitError: One dataset's item runs sit in more than one experiment.
+        PushSplitError: An item run was not linked to its dataset run, or one dataset's
+            item runs sit in more than one experiment.
     """
     by_case = _results_by_case(run)
     expected_digests = {case_id: _case_digest(results) for case_id, results in by_case.items()}
@@ -692,7 +700,8 @@ def _read_pushed(
         PushMismatchError: An item run lacks the metadata a push writes, is of a case the
             run does not map to its dataset, is of another item than the case maps to,
             or holds another input than the run evaluated.
-        PushSplitError: One dataset's item runs sit in more than one experiment.
+        PushSplitError: An item run was not linked to its dataset run, or one dataset's
+            item runs sit in more than one experiment.
     """
     found: dict[str, _ItemRun] = {}
     for group in groups:
@@ -724,8 +733,8 @@ def _read_dataset_run(
 
     Raises:
         PushMismatchError: An item run lacks the metadata a push writes.
-        PushSplitError: The item runs, a case's earlier ones included, sit in more than
-            one experiment.
+        PushSplitError: An item run, a case's earlier ones included, was not linked to
+            the dataset run, or the item runs sit in more than one experiment.
     """
     found: dict[str, _ItemRun] = {}
     experiment_ids: set[str] = set()
@@ -770,9 +779,15 @@ def _read_dataset_run(
         if not page.data or not cursor:
             break
 
+    # The SDK gave some items its own experiment id after linking them to the dataset
+    # run failed; see the module docstring.
+    if fallback := sorted(i for i in experiment_ids if _FALLBACK_EXPERIMENT_ID.match(i)):
+        raise PushSplitError(
+            f"the item runs under {run_name} in dataset {group.dataset!r} were not linked to "
+            f"the dataset run (experiment ids {fallback}); delete their traces and push "
+            "again once linking item runs to the dataset run works"
+        )
     if len(experiment_ids) > 1:
-        # The SDK gave some items its own experiment id after linking them to the
-        # dataset run failed; see the module docstring.
         raise PushSplitError(
             f"Langfuse shows the item runs under {run_name} in dataset {group.dataset!r} "
             f"in experiments {sorted(experiment_ids)}, not one; delete their traces "

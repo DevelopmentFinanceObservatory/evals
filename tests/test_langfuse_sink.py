@@ -1,5 +1,6 @@
 import datetime
 import json
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,13 +39,15 @@ class _FakeLangfuse:
     """The Langfuse client surface `langfuse_sink` uses, in memory.
 
     `create_dataset_item` keeps a field's stored value when given `None`, as Langfuse's
-    public API does, and stores whole-number floats as ints. `run_experiment` runs the task and evaluators on each item as the SDK does and keeps one
-    item run per item, its metadata the experiment's and the item's with every value a
-    string, and records each `run_experiment` call's datasets in `experiments`. Each item
-    run's experiment id is its dataset's run of that name, as `dataset_run_items.create`
-    returns it, except that the next `failed_links` items fall back to an id shared only
-    within their `run_experiment` call and report no dataset run id, as the SDK does when
-    that call fails.
+    public API does, and stores whole-number floats as ints. `run_experiment` runs the
+    task and evaluators on each item as the SDK does and keeps one item run per item, its
+    metadata the experiment's and the item's with every value a string, and records each
+    `run_experiment` call's datasets in `experiments`. Each item run's experiment id is
+    its dataset's run of that name, a UUID, as `dataset_run_items.create` returns it,
+    except that the next `failed_links` items fall back to a span id shared only within
+    their `run_experiment` call and report no dataset run id, as the SDK does when that
+    call fails. The tasks of the next `failed_tasks` items raise: as in the SDK, they
+    leave no item run and no item result.
     `api.experiments.list_items` reads one experiment's item runs back newest first, in one
     dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs
     written as ints, as JavaScript writes JSON. Item runs start at `now`, and their scores
@@ -63,6 +66,7 @@ class _FakeLangfuse:
         self.experiments: list[tuple[str, set[str]]] = []
         self.drop_runs = 0
         self.failed_links = 0
+        self.failed_tasks = 0
         self.drop_scores = 0
         self.hide_scores = False
         self.hidden_reads = 0
@@ -134,9 +138,12 @@ class _FakeLangfuse:
         **_: Any,
     ) -> Any:
         self.experiments.append((run_name, {item.dataset_name for item in data}))
-        fallback_id = f"fallback-{len(self.experiments)}"
+        fallback_id = _fallback_id(len(self.experiments))
         results = []
         for item in data:
+            if self.failed_tasks:
+                self.failed_tasks -= 1
+                continue
             experiment_id = dataset_run_id = _experiment_id(item.dataset_name, run_name)
             if self.failed_links:
                 self.failed_links -= 1
@@ -254,8 +261,13 @@ class _FakeLangfuse:
 
 
 def _experiment_id(dataset: str, run_name: str) -> str:
-    """The id of a dataset's run of a name, as linking an item run to it returns."""
-    return f"run-{dataset}-{run_name}"
+    """The id of a dataset's run of a name, a UUID, as linking an item run to it returns."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{dataset}/{run_name}"))
+
+
+def _fallback_id(call: int) -> str:
+    """The id the SDK falls back to in its `call`th `run_experiment` call: a span id."""
+    return f"{call:016x}"
 
 
 def _js_numbers(value: Any) -> Any:
@@ -676,7 +688,7 @@ def test_a_push_with_an_item_run_outside_its_dataset_run_raises_and_fails_verify
         _push(fake, _TWO_CASES)
     (name,) = {run["experiment"] for run in fake.runs}
 
-    with pytest.raises(PushSplitError, match="fallback-1"):
+    with pytest.raises(PushSplitError, match=_fallback_id(1)):
         _verify(fake, _TWO_CASES, name, timeout_s=0)
     with pytest.raises(PushSplitError):
         _push(fake, _TWO_CASES)
@@ -705,18 +717,63 @@ def test_a_case_sent_again_outside_the_first_experiment_raises() -> None:
 
     with pytest.raises(PushSplitError, match="not linked"):
         _push(fake, _TWO_CASES)
-    with pytest.raises(PushSplitError, match="fallback-2"):
+    with pytest.raises(PushSplitError, match=_fallback_id(2)):
         _verify(fake, _TWO_CASES, fake.runs[0]["experiment"], timeout_s=0)
 
 
-def test_a_push_whose_every_item_run_falls_back_raises() -> None:
+def test_a_push_whose_every_item_run_falls_back_raises_and_so_do_retries() -> None:
     fake = _with_items("a", "b")
     fake.failed_links = 2
 
     with pytest.raises(PushSplitError, match="not linked to the dataset run"):
         _push(fake, _TWO_CASES)
+    assert {run["experiment_id"] for run in fake.runs} == {_fallback_id(1)}
+    (name,) = {run["experiment"] for run in fake.runs}
 
-    assert {run["experiment_id"] for run in fake.runs} == {"fallback-1"}
+    with pytest.raises(PushSplitError, match=rf"not linked .*{_fallback_id(1)}"):
+        _push(fake, _TWO_CASES)
+    with pytest.raises(PushSplitError, match=rf"not linked .*{_fallback_id(1)}"):
+        _verify(fake, _TWO_CASES, name, timeout_s=0)
+    assert (len(fake.runs), len(fake.experiments), fake.score_writes) == (2, 1, [])
+
+
+def test_a_split_in_the_first_of_two_datasets_raises_and_so_does_a_retry() -> None:
+    run = _run(
+        _result("a", answer=Verdict.PASS),
+        _result("c", answer=Verdict.FAIL),
+        _result("b", answer=Verdict.PASS),
+    )
+    fake = _with_items("a", "c")
+    _add_items(fake, "b", dataset=_OTHER_DATASET)
+
+    def item_of(case_id: str) -> DatasetItemRef:
+        dataset = _OTHER_DATASET if case_id == "b" else _DATASET
+        return DatasetItemRef(dataset=dataset, item_id=_item_id(case_id, dataset))
+
+    # Case "a", the first item sent to the first dataset, falls back.
+    fake.failed_links = 1
+    fake.drop_scores = 2
+    with pytest.raises(PushSplitError, match=rf"dataset '{_DATASET}'"):
+        _push(fake, run, item_of=item_of)
+
+    with pytest.raises(PushSplitError, match=rf"dataset '{_DATASET}'"):
+        _push(fake, run, item_of=item_of)
+    with pytest.raises(PushSplitError, match=rf"dataset '{_DATASET}'"):
+        _verify(fake, run, fake.runs[0]["experiment"], item_of=item_of, timeout_s=0)
+    assert fake.experiments[1:] == []
+    assert fake.score_writes == []
+
+
+def test_an_item_whose_task_raised_is_left_out_and_reported_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _with_items("a", "b")
+    fake.failed_tasks = 1
+
+    with pytest.raises(PushIncompleteError, match=r"shows 1 of the 2 cases.*\['a'\]"):
+        _push(fake, _TWO_CASES)
+
+    assert "run_experiment returned 1 of 2 item runs" in caplog.text
 
 
 def test_outputs_for_a_trial_the_run_lacks_are_refused() -> None:
