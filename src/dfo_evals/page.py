@@ -1,0 +1,403 @@
+"""Build one static HTML page showing how each suite is doing over time.
+
+Run as ``python -m dfo_evals.page --root runs --out site/index.html
+--headline apis-search=answer``. The page holds no generated-at time, so the same runs
+always build the same bytes.
+"""
+
+import argparse
+import logging
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from html import escape
+from pathlib import Path
+from typing import Final
+
+from dfo_evals.records import iter_runs, read_run
+from dfo_evals.summary import (
+    PERCENT_DECIMALS,
+    GroupSummary,
+    RunSummary,
+    chronological,
+    display_percent,
+    rate_change_pp,
+    summarise_run,
+)
+
+logger = logging.getLogger(__name__)
+
+PAGE_TITLE: Final = "DFO eval results"
+HISTORY_LIMIT: Final = 30
+ALL_CASES_LABEL: Final = "All cases"
+NO_VALUE: Final = "n/a"
+# A change cell with nothing to compare against: a new group or the suite's first run.
+NO_PREVIOUS: Final = "new"
+MINUS_SIGN: Final = "\N{MINUS SIGN}"
+RANGE_SEPARATOR: Final = "\N{EN DASH}"
+DISTRIBUTION_SEPARATOR: Final = " \N{MIDDLE DOT} "
+_HEADLINE_SEPARATOR: Final = "="
+# Run, start time and revision are text; the rest of the history columns are numbers.
+_HISTORY_TEXT_COLUMNS: Final = 3
+_NUM_CLASS: Final = ' class="num"'
+
+_CSS: Final = """
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #5c5c5c;
+  --rule: #d6d6d6;
+  --head-bg: #f2f2f2;
+  --up: #1b6e3a;
+  --down: #a3261b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121212;
+    --fg: #ececec;
+    --muted: #a8a8a8;
+    --rule: #3a3a3a;
+    --head-bg: #1f1f1f;
+    --up: #6fd08f;
+    --down: #ff8a80;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  max-width: 64rem;
+  padding: 1rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 1.5rem; margin: 0 0 1rem; }
+h2 { font-size: 1.25rem; margin: 2rem 0 0.5rem; }
+p { margin: 0.25rem 0; }
+.meta, .note, footer { color: var(--muted); font-size: 0.875rem; }
+.table-wrap { overflow-x: auto; margin: 0.75rem 0; }
+table { border-collapse: collapse; min-width: 100%; }
+caption { text-align: left; font-weight: 600; padding: 0.25rem 0; }
+th, td { padding: 0.375rem 0.625rem; border-bottom: 1px solid var(--rule); text-align: left;
+  white-space: nowrap; }
+thead th { background: var(--head-bg); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+code { font-size: 0.9em; }
+footer { margin-top: 2rem; border-top: 1px solid var(--rule); padding-top: 0.5rem; }
+"""
+
+
+def build_page(*, root: Path, headline_checks: Mapping[str, str]) -> str:
+    """Build the results page from every run under a root.
+
+    Args:
+        root: Directory holding ``<suite>/<run_id>/`` run records.
+        headline_checks: Headline check name per suite; suites not named score a trial
+            as passing when no check fails and at least one passes.
+
+    Returns:
+        One self-contained HTML document.
+
+    Raises:
+        ValueError: The root holds no runs, or a headline check names a suite with
+            no runs.
+        FileNotFoundError: The root does not exist.
+    """
+    by_suite: defaultdict[str, list[RunSummary]] = defaultdict(list)
+    for run_dir in iter_runs(root=root):
+        run = read_run(run_dir)
+        suite = run.manifest.suite
+        by_suite[suite].append(summarise_run(run=run, headline_check=headline_checks.get(suite)))
+    if not by_suite:
+        raise ValueError(f"no runs found under {root}")
+    unknown = sorted(set(headline_checks) - set(by_suite))
+    if unknown:
+        raise ValueError(
+            f"headline check given for suites with no runs: {unknown}; "
+            f"suites found: {sorted(by_suite)}"
+        )
+    logger.info(
+        "read %d runs across %d suites",
+        sum(len(runs) for runs in by_suite.values()),
+        len(by_suite),
+    )
+
+    sections = [
+        _suite_section(
+            suite=suite,
+            runs=chronological(by_suite[suite]),
+            headline_check=headline_checks.get(suite),
+        )
+        for suite in sorted(by_suite)
+    ]
+    return _document("\n".join(sections))
+
+
+def format_rate(rate: float | None) -> str:
+    """Format a share as a percentage with one decimal, or "n/a" when None."""
+    percent = display_percent(rate)
+    if percent is None:
+        return NO_VALUE
+    return f"{percent:.{PERCENT_DECIMALS}f}%"
+
+
+def format_change(change_pp: float | None) -> str:
+    """Format a change in percentage points with an explicit sign and a real minus.
+
+    Returns "n/a" when the change is None because a rate is missing.
+    """
+    if change_pp is None:
+        return NO_VALUE
+    rounded = round(change_pp, PERCENT_DECIMALS)
+    magnitude = f"{abs(rounded):.{PERCENT_DECIMALS}f} pp"
+    if rounded > 0:
+        return f"+{magnitude}"
+    if rounded < 0:
+        return f"{MINUS_SIGN}{magnitude}"
+    return magnitude
+
+
+def format_time(moment: datetime) -> str:
+    """Format a timestamp as ISO 8601 in UTC, to the minute."""
+    return moment.astimezone(UTC).isoformat(timespec="minutes")
+
+
+def _suite_section(*, suite: str, runs: Sequence[RunSummary], headline_check: str | None) -> str:
+    """Render one suite: latest run, group table and history."""
+    latest = runs[-1]
+    previous = runs[-2] if len(runs) > 1 else None
+    manifest = latest.manifest
+    scoring = (
+        f"the headline check <code>{escape(headline_check)}</code> passes"
+        if headline_check is not None
+        else "no check fails and at least one passes"
+    )
+    return "\n".join(
+        (
+            f'<section aria-labelledby="{_suite_id(suite)}">',
+            f'<h2 id="{_suite_id(suite)}">{escape(suite)}</h2>',
+            '<p class="meta">Latest run <code>'
+            f"{escape(manifest.run_id)}</code>, started {escape(format_time(manifest.started_at))}"
+            f", revision <code>{escape(manifest.revision)}</code>.</p>",
+            f'<p class="note">A trial passes when {scoring}. Excluded trials are grader, '
+            "infra or reference faults and do not count towards scores.</p>",
+            _groups_table(suite=suite, latest=latest, previous=previous),
+            _history_table(suite=suite, runs=runs),
+            "</section>",
+        )
+    )
+
+
+def _groups_table(*, suite: str, latest: RunSummary, previous: RunSummary | None) -> str:
+    """Render the latest run's scores per group, with change since the previous run.
+
+    Per-case columns appear for multi-trial suites only; with one trial per case they
+    repeat the success rate.
+    """
+    headers = ["Group", "Scored trials", "Success rate", "Change since previous run"]
+    if latest.multi_trial:
+        headers += [
+            "Cases passing every trial",
+            f"Cases by passing trials (0{RANGE_SEPARATOR}{latest.trials_per_case})",
+        ]
+    headers.append("Excluded trials")
+
+    rows: list[tuple[str, GroupSummary, GroupSummary | None]] = [
+        (ALL_CASES_LABEL, latest.all_cases, previous.all_cases if previous else None)
+    ]
+    rows.extend(
+        (tag, group, previous.by_tag.get(tag) if previous else None)
+        for tag, group in latest.by_tag.items()
+    )
+
+    body = []
+    for label, group, before in rows:
+        cells = [
+            _num(str(group.scored_trials)),
+            _num(format_rate(group.success_rate)),
+            _change_cell(current=group, previous=before),
+        ]
+        if latest.multi_trial:
+            cells += [
+                _num(f"{group.cases_passing_all} of {group.cases_fully_scored}"),
+                _num(_format_distribution(group.pass_distribution)),
+                _num(_format_excluded(group)),
+            ]
+        else:
+            cells.append(_num(str(group.excluded_trials)))
+        body.append(f'<tr><th scope="row">{escape(label)}</th>{"".join(cells)}</tr>')
+    return _table(caption=f"Latest run of {suite} by group", headers=headers, rows=body)
+
+
+def _history_table(*, suite: str, runs: Sequence[RunSummary]) -> str:
+    """Render the last runs, newest first, with all-cases success rate and change."""
+    previous_runs: list[RunSummary | None] = [None, *runs[:-1]]
+    recent = list(zip(runs, previous_runs, strict=True))[-HISTORY_LIMIT:]
+    body = [
+        f'<tr><th scope="row"><code>{escape(run.manifest.run_id)}</code></th>'
+        f"<td>{escape(format_time(run.manifest.started_at))}</td>"
+        f"<td><code>{escape(run.manifest.revision)}</code></td>"
+        f"{_num(format_rate(run.all_cases.success_rate))}"
+        f"{_change_cell(current=run.all_cases, previous=before.all_cases if before else None)}"
+        "</tr>"
+        for run, before in reversed(recent)
+    ]
+    shown = f"last {len(recent)} runs" if len(recent) > 1 else "1 run"
+    return _table(
+        caption=f"History of {suite}, {shown}, newest first",
+        headers=["Run", "Started (UTC)", "Revision", "Success rate", "Change"],
+        rows=body,
+        text_columns=_HISTORY_TEXT_COLUMNS,
+    )
+
+
+def _table(
+    *, caption: str, headers: Sequence[str], rows: Sequence[str], text_columns: int = 1
+) -> str:
+    """Render a table in a scrolling wrapper; headers after ``text_columns`` are numeric."""
+    head = "".join(
+        f'<th scope="col"{_NUM_CLASS if index >= text_columns else ""}>{escape(header)}</th>'
+        for index, header in enumerate(headers)
+    )
+    return (
+        f'<div class="table-wrap" role="region" tabindex="0" aria-label="{escape(caption)}">'
+        f"<table><caption>{escape(caption)}</caption>"
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _num(text: str) -> str:
+    """Render a right-aligned numeric cell."""
+    return f'<td class="num">{escape(text)}</td>'
+
+
+def _change_cell(*, current: GroupSummary, previous: GroupSummary | None) -> str:
+    """Render a change cell; colour backs up the sign, never replaces it."""
+    if previous is None:
+        return _num(NO_PREVIOUS)
+    text = format_change(rate_change_pp(current=current, previous=previous))
+    if text.startswith("+"):
+        return f'<td class="num up">{escape(text)}</td>'
+    if text.startswith(MINUS_SIGN):
+        return f'<td class="num down">{escape(text)}</td>'
+    return _num(text)
+
+
+def _format_excluded(group: GroupSummary) -> str:
+    """Render excluded trials with the cases they fall in, as ``k in n cases``."""
+    noun = "case" if group.cases_with_excluded_trial == 1 else "cases"
+    return f"{group.excluded_trials} in {group.cases_with_excluded_trial} {noun}"
+
+
+def _format_distribution(distribution: tuple[int, ...] | None) -> str:
+    """Render a pass-count distribution as ``0: a · 1: b · ...``."""
+    if distribution is None:
+        return NO_VALUE
+    return DISTRIBUTION_SEPARATOR.join(
+        f"{passes}: {cases}" for passes, cases in enumerate(distribution)
+    )
+
+
+def _suite_id(suite: str) -> str:
+    """Return the element id for a suite heading; suite names are safe directory names."""
+    return escape(f"suite-{suite}")
+
+
+def _document(body: str) -> str:
+    """Wrap section markup in a complete HTML document."""
+    return "\n".join(
+        (
+            "<!DOCTYPE html>",
+            '<html lang="en-GB">',
+            "<head>",
+            '<meta charset="utf-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            f"<title>{escape(PAGE_TITLE)}</title>",
+            f"<style>{_CSS}</style>",
+            "</head>",
+            "<body>",
+            "<main>",
+            f"<h1>{escape(PAGE_TITLE)}</h1>",
+            body,
+            "</main>",
+            "<footer><p>Success rate is passes over scored trials. Change is in percentage "
+            "points against the previous run of the same suite. Tags can overlap, so group rows "
+            "need not add up to All cases.</p></footer>",
+            "</body>",
+            "</html>",
+            "",
+        )
+    )
+
+
+def parse_headline(value: str) -> tuple[str, str]:
+    """Parse one ``suite=check`` argument.
+
+    Args:
+        value: The argument text.
+
+    Returns:
+        The suite and check names.
+
+    Raises:
+        argparse.ArgumentTypeError: The value is not ``suite=check`` with both parts set.
+    """
+    suite, separator, check = value.partition(_HEADLINE_SEPARATOR)
+    suite, check = suite.strip(), check.strip()
+    if not separator or not suite or not check or _HEADLINE_SEPARATOR in check:
+        raise argparse.ArgumentTypeError(f"expected suite=check, got {value!r}")
+    return suite, check
+
+
+def _parser() -> argparse.ArgumentParser:
+    """Build the command-line parser."""
+    parser = argparse.ArgumentParser(
+        prog="dfo-evals-page", description="Build the DFO eval results page."
+    )
+    parser.add_argument("--root", type=Path, required=True, help="directory of run records")
+    parser.add_argument("--out", type=Path, required=True, help="HTML file to write")
+    parser.add_argument(
+        "--headline",
+        type=parse_headline,
+        action="append",
+        default=[],
+        metavar="SUITE=CHECK",
+        help="headline check for a suite; repeatable",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Build the page and write it to ``--out``.
+
+    Args:
+        argv: Command-line arguments, or None for ``sys.argv``.
+
+    Returns:
+        Process exit code, 0 on success.
+
+    Raises:
+        ValueError: The root holds no runs, or a headline names a suite with no runs.
+        FileNotFoundError: The root does not exist.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = _parser()
+    args = parser.parse_args(argv)
+    headline_checks: dict[str, str] = {}
+    for suite, check in args.headline:
+        if suite in headline_checks:
+            parser.error(f"--headline given twice for suite {suite!r}")
+        headline_checks[suite] = check
+
+    page = build_page(root=args.root, headline_checks=headline_checks)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(page)
+    logger.info("wrote %s", args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
