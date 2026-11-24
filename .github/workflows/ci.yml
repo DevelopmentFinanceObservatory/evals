@@ -68,6 +68,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --python 3.12
 
+      # The sync steps install the lock as it stands, so this step catches a
+      # dependency change in pyproject.toml without a relock.
+      - name: Lock matches pyproject.toml
+        env:
+          UV_FROZEN: "0"
+        run: uv lock --check
+
       - name: Ruff check
         run: uv run ruff check .
 
