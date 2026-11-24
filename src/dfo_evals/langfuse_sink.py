@@ -21,7 +21,11 @@ output for that trial, if given) in trial order. Each check is scored once per c
 the share of the case's trials whose verdict on it is a pass, over the trials that passed
 or failed it: 1.0 or 0.0 for a case run once, as a single-trial suite scores today.
 Unverifiable, n/a and unreached verdicts are left out, and a check no trial passed or
-failed gets no score. Each trial's number, fault, duration, cost, tags, input digest and
+failed gets no score. A score missing from an item run already in Langfuse is written
+by ``create_score`` with an id derived from the run name, dataset, item and check, and
+the item run's start time as its timestamp: Langfuse reads an item run's scores back
+only within a day of the item runs, and a score sent again with the same id and
+timestamp overwrites the first. Each trial's number, fault, duration, cost, tags, input digest and
 trace id are in the item run's metadata under ``trials``.
 
 The experiment is named ``<suite>/<run_id> <revision> <digest>``, where ``<digest>``
@@ -52,9 +56,11 @@ endpoints marked for removal.
 import json
 import logging
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 from langfuse import Evaluation, Langfuse
@@ -92,6 +98,10 @@ _CASE_ID_KEY: Final = "case_id"
 _CASE_DIGEST_KEY: Final = "case_digest"
 _OUTPUT_DIGEST_KEY: Final = "output_digest"
 _TRIALS_KEY: Final = "trials"
+# Namespace of the score ids a push writes when it repairs a missing score.
+_SCORE_ID_NAMESPACE: Final = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/DevelopmentFinanceObservatory/evals/langfuse-score"
+)
 
 
 class LangfuseSinkError(RuntimeError):
@@ -178,6 +188,7 @@ class _ItemRun:
     """One case's item run as Langfuse shows it."""
 
     trace_id: str
+    start_time: datetime
     item_id: str
     input: object
     case_digest: str
@@ -341,7 +352,9 @@ def push_run(
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
             the run again sends them.
         PushTimeoutError: Every case appeared but some scores did not within
-            ``timeout_s``. Pushing the run again writes the missing scores.
+            ``timeout_s``. Pushing the run again writes the missing scores, each under
+            the same id and timestamp as before, so a repeat overwrites rather than
+            adds.
     """
     outputs = outputs or {}
     if extra := sorted(set(outputs) - {(r.case_id, r.trial) for r in run.results}):
@@ -398,6 +411,7 @@ def push_run(
             scores=expected_scores,
         )
 
+    dataset_of = {case_id: group.dataset for group in groups for case_id in group.items}
     filled = 0
     for case_id, item_run in held.items():
         for evaluation in expected_scores[case_id]:
@@ -407,6 +421,16 @@ def push_run(
                     name=evaluation.name,
                     value=float(evaluation.value),
                     data_type=_SCORE_DATA_TYPE,
+                    score_id=_score_id(
+                        run_name=run_name,
+                        dataset=dataset_of[case_id],
+                        item_id=item_run.item_id,
+                        check=evaluation.name,
+                    ),
+                    # Langfuse reads an item run's scores back only within a day of
+                    # its items, and a resent score overwrites one of the same id and
+                    # timestamp, so a repair takes the item run's own time.
+                    timestamp=item_run.start_time,
                 )
                 filled += 1
     client.flush()
@@ -723,6 +747,7 @@ def _read_dataset_run(
                 str(metadata[_CASE_ID_KEY]),
                 _ItemRun(
                     trace_id=item.trace_id,
+                    start_time=item.start_time,
                     item_id=item.experiment_item_id,
                     input=_parsed(item.input),
                     case_digest=str(metadata[_CASE_DIGEST_KEY]),
@@ -889,6 +914,11 @@ def _cases_on_other_input(*, group: _DatasetCases, input_digests: Mapping[str, s
 def _input_matches(value: object, digest: str) -> bool:
     """Whether a value read from Langfuse is the input a stored input digest names."""
     return input_digest(value) == digest
+
+
+def _score_id(*, run_name: str, dataset: str, item_id: str, check: str) -> str:
+    """The id of a repaired score, the same each time it is written."""
+    return str(uuid.uuid5(_SCORE_ID_NAMESPACE, json.dumps([run_name, dataset, item_id, check])))
 
 
 def _results_by_case(run: Run) -> dict[str, list[CaseResult]]:

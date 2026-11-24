@@ -30,6 +30,8 @@ _DATASET = "search-core"
 _OTHER_DATASET = "search-extra"
 _STARTED = datetime.datetime(2026, 11, 1, tzinfo=datetime.UTC)
 _PAGE = 2
+# Langfuse reads an item run's scores back only within this time of the page's item runs.
+_SCORE_WINDOW = datetime.timedelta(days=1)
 
 
 class _FakeLangfuse:
@@ -43,7 +45,10 @@ class _FakeLangfuse:
     within their `run_experiment` call and report no dataset run id, as the SDK does when
     that call fails.
     `api.experiments.list_items` reads one experiment's item runs back newest first, in one
-    dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs written as ints, as JavaScript writes JSON.
+    dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs
+    written as ints, as JavaScript writes JSON. Item runs start at `now`, and their scores
+    read back only when timestamped within `_SCORE_WINDOW` of the page's item runs and
+    no later than `now`. `create_score` records each write in `score_writes`.
     The next push loses its first `drop_runs` item runs, and the scores of the next
     `drop_scores`, as a failed send would. `hide_scores` keeps scores from reading back,
     and the next `hidden_reads` reads show nothing, as before Langfuse shows a push.
@@ -61,6 +66,8 @@ class _FakeLangfuse:
         self.hide_scores = False
         self.hidden_reads = 0
         self.score_limits: list[int] = []
+        self.score_writes: list[dict[str, Any]] = []
+        self.now = _STARTED + datetime.timedelta(hours=1)
         self.api = SimpleNamespace(
             projects=SimpleNamespace(
                 get=lambda: SimpleNamespace(data=[SimpleNamespace(id=project)])
@@ -153,15 +160,30 @@ class _FakeLangfuse:
                     "metadata": {
                         key: str(value) for key, value in {**metadata, **item.metadata}.items()
                     },
+                    "start_time": self.now,
                     "scores": {e.name: e.value for e in evaluations},
+                    "score_times": {e.name: self.now for e in evaluations},
                     "data_types": {e.name: e.data_type for e in evaluations},
                 }
             )
         return SimpleNamespace(item_results=results)
 
-    def create_score(self, *, trace_id: str, name: str, value: float, data_type: str) -> None:
+    def create_score(
+        self,
+        *,
+        trace_id: str,
+        name: str,
+        value: float,
+        data_type: str,
+        score_id: str | None = None,
+        timestamp: datetime.datetime | None = None,
+    ) -> None:
+        self.score_writes.append(
+            {"id": score_id, "trace_id": trace_id, "name": name, "timestamp": timestamp}
+        )
         run = next(run for run in self.runs if run["trace_id"] == trace_id)
         run["scores"][name] = value
+        run["score_times"][name] = timestamp or self.now
         run["data_types"][name] = data_type
 
     def flush(self) -> None:
@@ -188,11 +210,16 @@ class _FakeLangfuse:
             if run["experiment"] == experiment_name and dataset_id in (None, run["dataset_id"])
         ]
         start = int(cursor or 0)
+        page = shown[start : start + _PAGE]
+        if page:
+            earliest = min(run["start_time"] for run in page) - _SCORE_WINDOW
+            latest = min(self.now, max(run["start_time"] for run in page) + _SCORE_WINDOW)
         return SimpleNamespace(
             data=[
                 SimpleNamespace(
                     id=run["trace_id"],
                     trace_id=run["trace_id"],
+                    start_time=run["start_time"],
                     experiment_id=run["experiment_id"],
                     experiment_item_id=run["item"],
                     input=json.dumps(_js_numbers(run["input"])),
@@ -200,9 +227,13 @@ class _FakeLangfuse:
                     metadata=run["metadata"],
                     scores=[]
                     if self.hide_scores
-                    else [SimpleNamespace(name=n, value=v) for n, v in run["scores"].items()],
+                    else [
+                        SimpleNamespace(name=n, value=v)
+                        for n, v in run["scores"].items()
+                        if earliest <= run["score_times"][n] <= latest
+                    ],
                 )
-                for run in shown[start : start + _PAGE]
+                for run in page
             ],
             meta=SimpleNamespace(cursor=str(start + _PAGE) if start + _PAGE < len(shown) else None),
         )
@@ -664,6 +695,38 @@ def test_a_push_whose_scores_were_lost_raises_and_pushing_again_fills_them() -> 
     assert len(fake.runs) == 2
     assert fake.runs_of("a")[0]["scores"] == {"answer": 1.0, "rows": 0.0}
     _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_a_score_repaired_days_after_the_push_reads_back_and_verifies() -> None:
+    fake = _with_items("a", "b")
+    fake.drop_scores = 2
+    with pytest.raises(PushTimeoutError):
+        _push(fake, _TWO_CASES)
+    fake.now += datetime.timedelta(days=2)
+
+    name = _push(fake, _TWO_CASES)
+
+    assert {write["timestamp"] for write in fake.score_writes} == {
+        run["start_time"] for run in fake.runs_of("a")
+    }
+    _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_a_score_repaired_twice_is_written_under_the_same_id_and_time() -> None:
+    fake = _with_items("a", "b")
+    fake.drop_scores = 2
+    with pytest.raises(PushTimeoutError):
+        _push(fake, _TWO_CASES)
+    fake.hide_scores = True
+
+    for _ in range(2):
+        with pytest.raises(PushTimeoutError):
+            _push(fake, _TWO_CASES)
+
+    first, second = fake.score_writes[:2], fake.score_writes[2:]
+    assert [w["name"] for w in first] == ["answer", "rows"]
+    assert first == second
+    assert len({w["id"] for w in first}) == 2
 
 
 def test_a_case_that_never_appears_raises_and_pushing_again_sends_only_it() -> None:
