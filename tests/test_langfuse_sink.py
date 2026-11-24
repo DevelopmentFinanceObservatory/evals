@@ -49,6 +49,7 @@ class _FakeLangfuse:
         self.hide_scores = False
         self.hidden_reads = 0
         self.score_limits: list[int] = []
+        self.shut_down = False
         self.api = SimpleNamespace(
             projects=SimpleNamespace(
                 get=lambda: SimpleNamespace(data=[SimpleNamespace(id=project)])
@@ -144,6 +145,9 @@ class _FakeLangfuse:
 
     def flush(self) -> None:
         pass
+
+    def shutdown(self) -> None:
+        self.shut_down = True
 
     def _list_items(
         self,
@@ -272,7 +276,7 @@ _TWO_CASES = _run(
 def test_a_client_of_another_project_is_refused() -> None:
     check_project(client=_FakeLangfuse(), project_id=_PROJECT)
 
-    with pytest.raises(WrongProjectError, match="another"):
+    with pytest.raises(WrongProjectError, match=_PROJECT):
         check_project(
             client=_FakeLangfuse(project="another"),
             project_id=_PROJECT,
@@ -286,16 +290,32 @@ def test_connect_refuses_an_empty_credential() -> None:
 
 def test_connect_refuses_keys_of_another_project(monkeypatch: pytest.MonkeyPatch) -> None:
     built: list[dict[str, Any]] = []
+    clients: list[_FakeLangfuse] = []
 
     def client(**kwargs: Any) -> _FakeLangfuse:
         built.append(kwargs)
-        return _FakeLangfuse(project="another")
+        clients.append(_FakeLangfuse(project="another"))
+        return clients[-1]
 
     monkeypatch.setattr("dfo_evals.langfuse_sink.Langfuse", client)
 
-    with pytest.raises(WrongProjectError):
+    with pytest.raises(WrongProjectError) as raised:
         connect(public_key="pk", secret_key="sk", base_url="http://lf", project_id=_PROJECT)
     assert built[0]["tracer_provider"] is not None
+    assert clients[0].shut_down
+    assert "another" not in str(raised.value)
+
+
+def test_connect_refuses_when_the_environment_disables_tracing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[dict[str, Any]] = []
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "False")
+    monkeypatch.setattr("dfo_evals.langfuse_sink.Langfuse", lambda **kw: built.append(kw))
+
+    with pytest.raises(ValueError, match="LANGFUSE_TRACING_ENABLED"):
+        connect(public_key="pk", secret_key="sk", base_url="http://lf", project_id=_PROJECT)
+    assert built == []
 
 
 def test_items_are_created_with_their_dataset_and_unchanged_items_are_not_rewritten() -> None:
