@@ -84,6 +84,8 @@ class CaseResult(BaseModel):
     """Result of one trial of one case, with a verdict per check.
 
     Attributes:
+        duration_s: Time the task took in seconds, or None when unknown, such as
+            for a task that raised.
         cost_usd: Cost of the trial in nominal USD, or None when unknown.
         tags: Grouping labels such as corpus file or family, used by reports.
     """
@@ -95,7 +97,7 @@ class CaseResult(BaseModel):
     input_digest: str
     checks: tuple[CheckResult, ...]
     fault: FaultClass | None = None
-    duration_s: float = Field(ge=0)
+    duration_s: float | None = Field(ge=0)
     cost_usd: float | None = Field(ge=0)
     trace_id: str | None = None
     tags: tuple[str, ...] = ()
