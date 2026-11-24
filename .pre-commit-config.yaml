@@ -1,0 +1,13 @@
+# Pre-commit hooks for dfo-evals
+# Install dev deps:  uv sync
+# Enable hooks:      uv run pre-commit install
+# Run all files:     uv run pre-commit run --all-files
+# Skip once:         git commit --no-verify
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.21
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format

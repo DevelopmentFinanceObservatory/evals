@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # `edited` catches a stacked PR's base retargeting, which emits only that
+    # event. Without it, required checks would hang on "Expected".
+    # `ready_for_review` starts the run when a draft is marked ready; the jobs
+    # skip while the pull request is a draft.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# `just check` covers the lint and test jobs below -- keep the two in sync if
+# either changes.
+jobs:
+  lint:
+    # `edited` fires on closed PRs too; closed PRs need no checks.
+    if: >-
+      github.event.pull_request.draft != true &&
+      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    runs-on: ubuntu-latest
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.12
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format check
+        run: uv run ruff format --check .
+
+      - name: ty check
+        run: uv run ty check
+
+  test:
+    if: >-
+      github.event.pull_request.draft != true &&
+      (github.event_name != 'pull_request' || github.event.pull_request.state == 'open')
+    runs-on: ubuntu-latest
+    env:
+      UV_FROZEN: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --frozen --python ${{ matrix.python-version }}
+
+      - name: Test
+        run: uv run pytest
