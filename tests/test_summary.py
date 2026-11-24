@@ -4,7 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.records import (
+    TASK_CHECK_NAME,
+    CaseResult,
+    CheckResult,
+    FaultClass,
+    Run,
+    RunManifest,
+    Verdict,
+)
 from dfo_evals.summary import (
     GroupSummary,
     MissingHeadlineCheckError,
@@ -96,6 +104,37 @@ def test_agent_and_upstream_faults_count_as_fails(fault: FaultClass) -> None:
     result = make_case(verdicts={HEADLINE: Verdict.FAIL}, fault=fault)
 
     assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.FAIL
+
+
+@pytest.mark.parametrize("fault", [FaultClass.AGENT, FaultClass.UPSTREAM])
+def test_agent_and_upstream_faults_fail_a_trial_with_a_passing_headline(
+    fault: FaultClass,
+) -> None:
+    result = make_case(verdicts={HEADLINE: Verdict.PASS}, fault=fault)
+
+    assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.FAIL
+
+
+def test_an_upstream_fault_with_a_passing_headline_is_not_scored_a_success() -> None:
+    run = make_run(make_case(verdicts={HEADLINE: Verdict.PASS}, fault=FaultClass.UPSTREAM))
+
+    summary = summarise_run(run=run, headline_check=HEADLINE)
+
+    assert summary.all_cases.success_rate == 0.0
+
+
+@pytest.mark.parametrize("headline_check", [HEADLINE, None])
+def test_a_crashed_task_fails_without_the_headline_check(headline_check: str | None) -> None:
+    result = make_case(verdicts={TASK_CHECK_NAME: Verdict.FAIL})
+
+    assert trial_outcome(result=result, headline_check=headline_check) is TrialOutcome.FAIL
+
+
+@pytest.mark.parametrize("fault", [FaultClass.GRADER, FaultClass.INFRA, FaultClass.REFERENCE])
+def test_an_excluding_fault_outranks_a_crashed_task(fault: FaultClass) -> None:
+    result = make_case(verdicts={TASK_CHECK_NAME: Verdict.FAIL}, fault=fault)
+
+    assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.EXCLUDED
 
 
 def test_the_headline_check_alone_decides_the_trial() -> None:

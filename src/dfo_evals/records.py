@@ -27,6 +27,8 @@ from pydantic import (
 SCHEMA_VERSION: Final = 1
 MANIFEST_FILE: Final = "manifest.json"
 RESULTS_FILE: Final = "results.jsonl"
+# Name of the single FAIL check recorded for a trial whose task raised.
+TASK_CHECK_NAME: Final = "task"
 
 # Run and suite names become directory names, so they must not escape or hide.
 _SAFE_NAME_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"

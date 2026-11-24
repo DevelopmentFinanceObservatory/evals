@@ -1,6 +1,8 @@
 """Tests for converting a Pydantic Evals report into a run."""
 
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,6 +11,7 @@ from pydantic_evals.evaluators import EvaluationReason, EvaluatorContext
 from pydantic_evals.reporting import EvaluationReport
 
 from dfo_evals.checks import verdict
+from dfo_evals.page import build_page
 from dfo_evals.records import FaultClass, RunManifest, Verdict, read_run, write_run
 from dfo_evals.report import TASK_CHECK_NAME, input_digest, run_from_report
 
@@ -52,6 +55,10 @@ def free_text(ctx: EvaluatorContext[Any, int, Any]) -> str:
 
 def closeness(ctx: EvaluatorContext[Any, int, Any]) -> float:
     return 0.5
+
+
+def answer(ctx: EvaluatorContext[Any, int, Any]) -> bool:
+    return ctx.output > 0
 
 
 def crashes(ctx: EvaluatorContext[Any, int, Any]) -> bool:
@@ -135,6 +142,21 @@ def test_a_task_that_raises_becomes_a_failing_task_check():
     assert result.duration_s is None
     assert result.fault is None
     assert result.input_digest == input_digest({"x": -1})
+
+
+def test_a_page_with_a_headline_check_builds_and_scores_a_crashed_task_as_a_fail(
+    tmp_path: Path,
+):
+    report = evaluate(
+        [Case(name="ok", inputs={"x": 1}), Case(name="bad", inputs={"x": -1})], answer
+    )
+    write_run(root=tmp_path, run=run_from_report(report=report, manifest=MANIFEST))
+
+    page = build_page(root=tmp_path, headline_checks={MANIFEST.suite: "answer"})
+
+    row = re.search(r'<tr><th scope="row">All cases</th>(.*?)</tr>', page)
+    assert row
+    assert re.findall(r"<td[^>]*>(.*?)</td>", row.group(1))[:2] == ["2", "50.0%"]
 
 
 def test_fault_of_classifies_a_task_that_raised():

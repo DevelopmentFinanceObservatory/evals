@@ -14,10 +14,17 @@ from typing import Any, Final
 from pydantic_core import to_jsonable_python
 from pydantic_evals.reporting import EvaluationReport, ReportCase, ReportCaseFailure
 
-from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.records import (
+    TASK_CHECK_NAME,
+    CaseResult,
+    CheckResult,
+    FaultClass,
+    Run,
+    RunManifest,
+    Verdict,
+)
 
 DIGEST_PREFIX: Final = "sha256:"
-TASK_CHECK_NAME: Final = "task"
 _SINGLE_TRIAL: Final = 1
 _VERDICT_VALUES: Final = frozenset(item.value for item in Verdict)
 
