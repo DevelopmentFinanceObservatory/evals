@@ -37,7 +37,8 @@ _SCORE_WINDOW = datetime.timedelta(days=1)
 class _FakeLangfuse:
     """The Langfuse client surface `langfuse_sink` uses, in memory.
 
-    `run_experiment` runs the task and evaluators on each item as the SDK does and keeps one
+    `create_dataset_item` keeps a field's stored value when given `None`, as Langfuse's
+    public API does, and stores whole-number floats as ints. `run_experiment` runs the task and evaluators on each item as the SDK does and keeps one
     item run per item, its metadata the experiment's and the item's with every value a
     string, and records each `run_experiment` call's datasets in `experiments`. Each item
     run's experiment id is its dataset's run of that name, as `dataset_run_items.create`
@@ -98,12 +99,22 @@ class _FakeLangfuse:
         status: DatasetStatus,
     ) -> DatasetItem:
         self.item_writes.append(id)
+        held = self.items.get(id)
+        # Langfuse reads a null field as absent and keeps the stored value.
+        fields = {
+            name: _js_numbers(value)
+            if value is not None
+            else (getattr(held, name) if held is not None else None)
+            for name, value in {
+                "input": input,
+                "expected_output": expected_output,
+                "metadata": metadata,
+            }.items()
+        }
         self.items[id] = DatasetItem(
             id=id,
             status=status,
-            input=input,
-            expected_output=expected_output,
-            metadata=metadata,
+            **fields,
             dataset_id=self.datasets[dataset_name],
             dataset_name=dataset_name,
             created_at=_STARTED,
@@ -394,6 +405,36 @@ def test_items_are_created_with_their_dataset_and_unchanged_items_are_not_rewrit
     assert (created, unchanged, changed) == (["x:1", "x:2"], [], ["x:2"])
     assert fake.item_writes == ["x:1", "x:2", "x:2"]
     assert fake.items["x:1"].expected_output == ["a"]
+
+
+def test_a_none_field_keeps_the_stored_value_and_a_second_sync_writes_nothing() -> None:
+    fake = _FakeLangfuse()
+    full = DatasetItemSpec(
+        item_id="x:1", input={"q": 1.0}, expected_output=["a"], metadata={"k": 2.0}
+    )
+    upsert_items(client=fake, dataset="x", items=[full])
+    bare = DatasetItemSpec(item_id="x:1", input={"q": 1})
+
+    first = upsert_items(client=fake, dataset="x", items=[bare])
+    second = upsert_items(client=fake, dataset="x", items=[bare])
+    again = upsert_items(client=fake, dataset="x", items=[full])
+
+    assert (first, second, again) == ([], [], [])
+    assert (fake.items["x:1"].expected_output, fake.items["x:1"].metadata) == (["a"], {"k": 2})
+
+
+def test_a_field_replaced_by_another_value_is_written_once() -> None:
+    fake = _FakeLangfuse()
+    upsert_items(
+        client=fake,
+        dataset="x",
+        items=[DatasetItemSpec(item_id="x:1", input={"q": 1}, metadata={"k": 1})],
+    )
+    emptied = [DatasetItemSpec(item_id="x:1", input={"q": 1}, metadata={})]
+
+    assert upsert_items(client=fake, dataset="x", items=emptied) == ["x:1"]
+    assert upsert_items(client=fake, dataset="x", items=emptied) == []
+    assert fake.items["x:1"].metadata == {}
 
 
 def test_an_archived_item_is_written_again_as_active() -> None:

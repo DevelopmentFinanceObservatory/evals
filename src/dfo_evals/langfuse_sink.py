@@ -140,11 +140,17 @@ class PushSplitError(LangfuseSinkError):
 class DatasetItemSpec:
     """A dataset item as a suite defines it.
 
+    ``None`` in ``expected_output`` or ``metadata`` keeps the value Langfuse holds: its
+    public API reads a null field as absent and keeps the stored value, so no value
+    clears one. To replace a stored value, give another, such as ``{}``.
+
     Attributes:
         item_id: Stable item id, unique across every dataset in the project.
-        input: The case's input, any JSON-serialisable value.
-        expected_output: What the case expects, any JSON-serialisable value.
-        metadata: Extra fields shown with the item, any JSON-serialisable value.
+        input: The case's input, any JSON-serialisable value but ``None``.
+        expected_output: What the case expects, any JSON-serialisable value, or
+            ``None`` to keep what Langfuse holds.
+        metadata: Extra fields shown with the item, any JSON-serialisable value, or
+            ``None`` to keep what Langfuse holds.
     """
 
     item_id: str
@@ -255,6 +261,8 @@ def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemS
     """Write each item to a dataset where Langfuse lacks it or holds it differently.
 
     Creates the dataset if it is missing. An archived item is written again as active.
+    A ``None`` field keeps the stored value, so it never counts as a difference.
+    Values compare by digest, whole-number floats as ints, as Langfuse may return them.
 
     Args:
         client: The Langfuse client.
@@ -278,25 +286,24 @@ def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemS
     held_items = held.items if held else {}
     written = []
     for spec in items:
-        input_, expected_output, metadata = (
-            to_jsonable_python(spec.input),
-            to_jsonable_python(spec.expected_output),
-            to_jsonable_python(spec.metadata),
-        )
+        wanted = {
+            "input": to_jsonable_python(spec.input),
+            "expected_output": to_jsonable_python(spec.expected_output),
+            "metadata": to_jsonable_python(spec.metadata),
+        }
         item = held_items.get(spec.item_id)
         if (
             item is not None
             and item.status == DatasetStatus.ACTIVE
-            and (item.input, item.expected_output, item.metadata)
-            == (input_, expected_output, metadata)
+            and not _changed_fields(held=item, wanted=wanted)
         ):
             continue
         client.create_dataset_item(
             dataset_name=dataset,
             id=spec.item_id,
-            input=input_,
-            expected_output=expected_output,
-            metadata=metadata,
+            input=wanted["input"],
+            expected_output=wanted["expected_output"],
+            metadata=wanted["metadata"],
             status=DatasetStatus.ACTIVE,
         )
         written.append(spec.item_id)
@@ -813,6 +820,18 @@ def _missing(
         elif lacking := sorted(set(wanted) - set(held[case_id].scores)):
             missing.append(f"case {case_id!r} scores {lacking}")
     return missing
+
+
+def _changed_fields(*, held: DatasetItem, wanted: Mapping[str, object]) -> list[str]:
+    """The fields of a held item that a write of ``wanted`` would change.
+
+    A ``None`` field keeps the stored value, as Langfuse treats it, so it never changes.
+    """
+    return [
+        name
+        for name, value in wanted.items()
+        if value is not None and _digest(value) != _digest(getattr(held, name))
+    ]
 
 
 def _held_dataset(*, client: Langfuse, dataset: str, create: bool) -> _HeldDataset | None:
