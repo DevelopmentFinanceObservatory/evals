@@ -247,6 +247,27 @@ def test_tags_that_differ_between_repeats_raise_before_the_run_is_saved():
         run_from_report(report=report, manifest=MANIFEST, tags_of=lambda _: next(trials))
 
 
+def test_trace_of_records_the_system_trace_for_cases_and_task_failures():
+    report = evaluate([Case(name="ok", inputs={"x": 1}), Case(name="broken", inputs={"x": -1})])
+
+    run = run_from_report(
+        report=report, manifest=MANIFEST, trace_of=lambda case: f"system-{case.name}"
+    )
+
+    assert {result.case_id: result.trace_id for result in run.results} == {
+        "ok": "system-ok",
+        "broken": "system-broken",
+    }
+
+
+def test_without_trace_of_no_trace_id_is_recorded():
+    report = evaluate([Case(name="ok", inputs={"x": 1}), Case(name="broken", inputs={"x": -1})])
+
+    run = run_from_report(report=report, manifest=MANIFEST)
+
+    assert [result.trace_id for result in run.results] == [None, None]
+
+
 def test_results_are_ordered_by_case_id_then_trial():
     report = evaluate(
         [

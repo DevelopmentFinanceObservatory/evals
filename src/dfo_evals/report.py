@@ -33,6 +33,7 @@ type AnyReportCaseFailure = ReportCaseFailure[Any, Any, Any]
 # Failures carry the same inputs and metadata, so tags can be derived for both.
 type TagsOf = Callable[[AnyReportCase | AnyReportCaseFailure], tuple[str, ...]]
 type FaultOf = Callable[[AnyReportCase | AnyReportCaseFailure], FaultClass | None]
+type TraceOf = Callable[[AnyReportCase | AnyReportCaseFailure], str | None]
 
 
 def input_digest(inputs: object) -> str:
@@ -67,6 +68,7 @@ def run_from_report(
     manifest: RunManifest,
     tags_of: TagsOf | None = None,
     fault_of: FaultOf | None = None,
+    trace_of: TraceOf | None = None,
 ) -> Run:
     """Convert an evaluation report into a run with one result per case and trial.
 
@@ -85,6 +87,10 @@ def run_from_report(
             give every trial of a case the same tags. None gives every case no tags.
         fault_of: Classifies who is at fault for a case or task failure, such as
             ``INFRA`` for a timeout.
+        trace_of: Extracts the trace id of the system under test from a case or task
+            failure, such as one the system returned in its response. None records
+            no trace id. The trace of the Pydantic Evals runner is never recorded,
+            since it identifies the runner and can be empty.
 
     Returns:
         The run, with results ordered by case id then trial.
@@ -96,9 +102,12 @@ def run_from_report(
             evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
-    results = [_result_from_case(case, tags_of=tags_of, fault_of=fault_of) for case in report.cases]
+    results = [
+        _result_from_case(case, tags_of=tags_of, fault_of=fault_of, trace_of=trace_of)
+        for case in report.cases
+    ]
     results += [
-        _result_from_failure(failure, tags_of=tags_of, fault_of=fault_of)
+        _result_from_failure(failure, tags_of=tags_of, fault_of=fault_of, trace_of=trace_of)
         for failure in report.failures
     ]
 
@@ -130,7 +139,11 @@ def _reject_report_evaluator_output(report: EvaluationReport[Any, Any, Any]) -> 
 
 
 def _result_from_case(
-    case: AnyReportCase, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+    case: AnyReportCase,
+    *,
+    tags_of: TagsOf | None,
+    fault_of: FaultOf | None,
+    trace_of: TraceOf | None,
 ) -> CaseResult:
     """Convert one successful report case into a case result."""
     case_id, trial = _case_id_and_trial(name=case.name, source_case_name=case.source_case_name)
@@ -178,13 +191,17 @@ def _result_from_case(
         ),
         duration_s=case.task_duration,
         cost_usd=None,
-        trace_id=case.trace_id,
+        trace_id=trace_of(case) if trace_of is not None else None,
         tags=tags_of(case) if tags_of is not None else (),
     )
 
 
 def _result_from_failure(
-    failure: AnyReportCaseFailure, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+    failure: AnyReportCaseFailure,
+    *,
+    tags_of: TagsOf | None,
+    fault_of: FaultOf | None,
+    trace_of: TraceOf | None,
 ) -> CaseResult:
     """Convert a task that raised into a case result with one failing ``task`` check."""
     case_id, trial = _case_id_and_trial(
@@ -200,7 +217,7 @@ def _result_from_failure(
         fault=_fault(failure, fault_of=fault_of, default=None),
         duration_s=None,
         cost_usd=None,
-        trace_id=failure.trace_id,
+        trace_id=trace_of(failure) if trace_of is not None else None,
         tags=tags_of(failure) if tags_of is not None else (),
     )
 
