@@ -12,6 +12,7 @@ from dfo_evals.langfuse_sink import (
     InputMismatchError,
     PushIncompleteError,
     PushMismatchError,
+    PushSplitError,
     PushTimeoutError,
     UnknownCaseError,
     WrongProjectError,
@@ -36,7 +37,11 @@ class _FakeLangfuse:
 
     `run_experiment` runs the task and evaluators on each item as the SDK does and keeps one
     item run per item, its metadata the experiment's and the item's with every value a
-    string, and records each `run_experiment` call's datasets in `experiments`.
+    string, and records each `run_experiment` call's datasets in `experiments`. Each item
+    run's experiment id is its dataset's run of that name, as `dataset_run_items.create`
+    returns it, except that the next `failed_links` items fall back to an id shared only
+    within their `run_experiment` call and report no dataset run id, as the SDK does when
+    that call fails.
     `api.experiments.list_items` reads one experiment's item runs back newest first, in one
     dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs written as ints, as JavaScript writes JSON.
     The next push loses its first `drop_runs` item runs, and the scores of the next
@@ -51,6 +56,7 @@ class _FakeLangfuse:
         self.runs: list[dict[str, Any]] = []
         self.experiments: list[tuple[str, set[str]]] = []
         self.drop_runs = 0
+        self.failed_links = 0
         self.drop_scores = 0
         self.hide_scores = False
         self.hidden_reads = 0
@@ -110,8 +116,13 @@ class _FakeLangfuse:
         **_: Any,
     ) -> Any:
         self.experiments.append((run_name, {item.dataset_name for item in data}))
+        fallback_id = f"fallback-{len(self.experiments)}"
         results = []
         for item in data:
+            experiment_id = dataset_run_id = _experiment_id(item.dataset_name, run_name)
+            if self.failed_links:
+                self.failed_links -= 1
+                experiment_id, dataset_run_id = fallback_id, None
             output = task(item=item)
             evaluations = [
                 evaluation
@@ -123,7 +134,7 @@ class _FakeLangfuse:
                     metadata=item.metadata,
                 )
             ]
-            results.append(output)
+            results.append(SimpleNamespace(output=output, dataset_run_id=dataset_run_id))
             if self.drop_runs:
                 self.drop_runs -= 1
                 continue
@@ -133,6 +144,7 @@ class _FakeLangfuse:
             self.runs.append(
                 {
                     "experiment": run_name,
+                    "experiment_id": experiment_id,
                     "item": item.id,
                     "input": item.input,
                     "dataset_id": item.dataset_id,
@@ -181,6 +193,7 @@ class _FakeLangfuse:
                 SimpleNamespace(
                     id=run["trace_id"],
                     trace_id=run["trace_id"],
+                    experiment_id=run["experiment_id"],
                     experiment_item_id=run["item"],
                     input=json.dumps(_js_numbers(run["input"])),
                     output=json.dumps(_js_numbers(json.loads(run["output"]))),
@@ -196,6 +209,11 @@ class _FakeLangfuse:
 
     def runs_of(self, case_id: str) -> list[dict[str, Any]]:
         return [run for run in self.runs if run["metadata"]["case_id"] == case_id]
+
+
+def _experiment_id(dataset: str, run_name: str) -> str:
+    """The id of a dataset's run of a name, as linking an item run to it returns."""
+    return f"run-{dataset}-{run_name}"
 
 
 def _js_numbers(value: Any) -> Any:
@@ -576,6 +594,57 @@ def test_two_cases_mapped_to_one_item_are_refused() -> None:
         _push(fake, _TWO_CASES, item_of=lambda _: _item("a"))
 
     assert fake.runs == []
+
+
+def test_a_push_with_an_item_run_outside_its_dataset_run_raises_and_fails_verify() -> None:
+    fake = _with_items("a", "b")
+    fake.failed_links = 1
+
+    with pytest.raises(PushSplitError, match=rf"dataset '{_DATASET}' were not linked"):
+        _push(fake, _TWO_CASES)
+    (name,) = {run["experiment"] for run in fake.runs}
+
+    with pytest.raises(PushSplitError, match="fallback-1"):
+        _verify(fake, _TWO_CASES, name, timeout_s=0)
+    with pytest.raises(PushSplitError):
+        _push(fake, _TWO_CASES)
+    assert len(fake.runs) == 2
+
+
+def test_a_case_sent_again_lands_in_the_experiment_of_the_first_push() -> None:
+    fake = _with_items("a", "b")
+    fake.drop_runs = 1
+
+    with pytest.raises(PushIncompleteError):
+        _push(fake, _TWO_CASES)
+    name = _push(fake, _TWO_CASES)
+
+    assert len(fake.experiments) == 2
+    assert {run["experiment_id"] for run in fake.runs} == {_experiment_id(_DATASET, name)}
+    _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+def test_a_case_sent_again_outside_the_first_experiment_raises() -> None:
+    fake = _with_items("a", "b")
+    fake.drop_runs = 1
+    with pytest.raises(PushIncompleteError):
+        _push(fake, _TWO_CASES)
+    fake.failed_links = 1
+
+    with pytest.raises(PushSplitError, match="not linked"):
+        _push(fake, _TWO_CASES)
+    with pytest.raises(PushSplitError, match="fallback-2"):
+        _verify(fake, _TWO_CASES, fake.runs[0]["experiment"], timeout_s=0)
+
+
+def test_a_push_whose_every_item_run_falls_back_raises() -> None:
+    fake = _with_items("a", "b")
+    fake.failed_links = 2
+
+    with pytest.raises(PushSplitError, match="not linked to the dataset run"):
+        _push(fake, _TWO_CASES)
+
+    assert {run["experiment_id"] for run in fake.runs} == {"fallback-1"}
 
 
 def test_outputs_for_a_trial_the_run_lacks_are_refused() -> None:

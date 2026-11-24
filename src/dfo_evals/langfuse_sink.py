@@ -33,13 +33,20 @@ Every digest here is taken after whole-number floats become integers, so a store
 returns ``1.0`` as ``1`` still matches. Langfuse Cloud returned outputs verbatim on
 24 November 2026.
 
-langfuse's ``run_experiment`` (4.14 to 4.18) takes each experiment's id from
-``dataset_run_items.create``, an endpoint the SDK marks for removal from Langfuse Cloud
-on 16 November 2026. It still answered on 24 November 2026. Once it goes, the SDK logs
-"Failed to create dataset run item" for each item and falls back to one random
-experiment id per ``run_experiment`` call: one push still lands as one experiment per
-dataset, but a re-push that sends missing cases lands under a second experiment id with
-the same run name. Reading back by experiment name and dataset sees both.
+Each dataset's item runs must sit in one experiment. langfuse's ``run_experiment``
+(4.14 to 4.18, ``Langfuse._process_experiment_item``) takes each item run's experiment
+id from ``dataset_run_items.create``, which returns the dataset's run of that name, so
+a re-push lands in the same experiment. The caller cannot set the id. When that call
+fails for an item, as it will once Langfuse Cloud drops the endpoint (marked for
+removal on 16 November 2026, still answering on 24 November 2026), the SDK logs
+"Failed to create dataset run item" and gives that item a random id shared only within
+the one ``run_experiment`` call. A push raises ``PushSplitError`` when any item run
+it sends is not linked to the dataset run, which each item's result reports. Reading
+back by name and dataset would merge experiments, so a push or verification that finds
+one dataset's item runs under more than one experiment id raises it too. Verification
+cannot tell a dataset run from a fallback id when every item run of a dataset shares
+one: the only lookup of a dataset run by name, ``datasets.get_run``, is among the
+endpoints marked for removal.
 """
 
 import json
@@ -113,6 +120,10 @@ class PushIncompleteError(LangfuseSinkError):
 
 class PushTimeoutError(LangfuseSinkError):
     """Langfuse did not show the whole push before the timeout."""
+
+
+class PushSplitError(LangfuseSinkError):
+    """One dataset's item runs of a push sit in more than one experiment."""
 
 
 @dataclass(frozen=True)
@@ -324,6 +335,9 @@ def push_run(
         PushMismatchError: Langfuse holds a case under this experiment that differs from
             the run's, in a dataset or item the case does not map to, or on another
             input.
+        PushSplitError: An item run sent was not linked to its dataset run, or one
+            dataset's item runs, those already held or those just sent, sit in more
+            than one experiment. Pushing again does not mend it.
         PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
             the run again sends them.
         PushTimeoutError: Every case appeared but some scores did not within
@@ -373,6 +387,7 @@ def push_run(
             client=client,
             run=run,
             run_name=run_name,
+            dataset=group.dataset,
             data=[
                 group.items[case_id].model_copy(
                     update={"metadata": _item_run_metadata(by_case[case_id], case_outputs[case_id])}
@@ -454,6 +469,7 @@ def verify_pushed(
             digests.
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
             shows a case in a dataset or item it does not map to, or on another input.
+        PushSplitError: One dataset's item runs sit in more than one experiment.
         PushTimeoutError: Langfuse still lacks a case or score after ``timeout_s``.
     """
     by_case = _results_by_case(run)
@@ -493,6 +509,7 @@ def _await_visible(
     Raises:
         PushMismatchError: Langfuse shows a case or score that differs from the run, or
             a case in a dataset or item it does not map to, or on another input.
+        PushSplitError: One dataset's item runs sit in more than one experiment.
     """
     by_case = _results_by_case(run)
     expected_digests = {case_id: _case_digest(results) for case_id, results in by_case.items()}
@@ -575,11 +592,17 @@ def _send(
     client: Langfuse,
     run: Run,
     run_name: str,
+    dataset: str,
     data: list[DatasetItem],
     outputs: Mapping[str, object],
     scores: Mapping[str, list[Evaluation]],
 ) -> None:
-    """Send one item run per dataset item through ``run_experiment``."""
+    """Send one item run per item of one dataset through ``run_experiment``.
+
+    Raises:
+        PushSplitError: An item run sent was not linked to the dataset run, or the item
+            runs were linked to more than one.
+    """
 
     def task(*, item: ExperimentItem, **_: object) -> object:
         if not isinstance(item, DatasetItem):
@@ -614,6 +637,14 @@ def _send(
             len(result.item_results),
             len(data),
         )
+    linked = {item_result.dataset_run_id for item_result in result.item_results}
+    if None in linked or len(linked) > 1:
+        # The SDK gave these item runs its own experiment id; see the module docstring.
+        raise PushSplitError(
+            f"the items sent under {run_name} to dataset {dataset!r} were not linked to the "
+            f"dataset run (dataset run ids {sorted(map(str, linked))}); delete their traces "
+            "and push again once linking item runs to the dataset run works"
+        )
 
 
 def _read_pushed(
@@ -630,12 +661,11 @@ def _read_pushed(
         PushMismatchError: An item run lacks the metadata a push writes, is of a case the
             run does not map to its dataset, is of another item than the case maps to,
             or holds another input than the run evaluated.
+        PushSplitError: One dataset's item runs sit in more than one experiment.
     """
     found: dict[str, _ItemRun] = {}
     for group in groups:
-        shown = _read_dataset_run(
-            client=client, run=run, run_name=run_name, dataset_id=group.dataset_id
-        )
+        shown = _read_dataset_run(client=client, run=run, run_name=run_name, group=group)
         if stray := sorted(set(shown) - set(group.items)):
             raise PushMismatchError(
                 f"Langfuse shows cases {stray} under {run_name} in dataset "
@@ -657,21 +687,24 @@ def _read_pushed(
 
 
 def _read_dataset_run(
-    *, client: Langfuse, run: Run, run_name: str, dataset_id: str
+    *, client: Langfuse, run: Run, run_name: str, group: _DatasetCases
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in one dataset, newest first.
 
     Raises:
         PushMismatchError: An item run lacks the metadata a push writes.
+        PushSplitError: The item runs, a case's earlier ones included, sit in more than
+            one experiment.
     """
     found: dict[str, _ItemRun] = {}
+    experiment_ids: set[str] = set()
     cursor: str | None = None
     while True:
         page = client.api.experiments.list_items(
             # No item run of this run's push can start before the run did.
             from_start_time=run.manifest.started_at,
             experiment_name=run_name,
-            dataset_id=dataset_id,
+            dataset_id=group.dataset_id,
             fields=_READ_FIELDS,
             limit=_PAGE_SIZE,
             score_limit=_MAX_SCORES,
@@ -684,6 +717,7 @@ def _read_dataset_run(
                 raise PushMismatchError(
                     f"item run {item.id} under {run_name} lacks the metadata a push writes"
                 )
+            experiment_ids.add(item.experiment_id)
             # Newest first, so a case sent twice reads as its latest item run.
             found.setdefault(
                 str(metadata[_CASE_ID_KEY]),
@@ -702,7 +736,17 @@ def _read_dataset_run(
             )
         cursor = page.meta.cursor
         if not page.data or not cursor:
-            return found
+            break
+
+    if len(experiment_ids) > 1:
+        # The SDK gave some items its own experiment id after linking them to the
+        # dataset run failed; see the module docstring.
+        raise PushSplitError(
+            f"Langfuse shows the item runs under {run_name} in dataset {group.dataset!r} "
+            f"in experiments {sorted(experiment_ids)}, not one; delete their traces "
+            "and push again once linking item runs to the dataset run works"
+        )
+    return found
 
 
 def _check_matches(
