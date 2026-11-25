@@ -14,10 +14,17 @@ from typing import Any, Final
 from pydantic_core import to_jsonable_python
 from pydantic_evals.reporting import EvaluationReport, ReportCase, ReportCaseFailure
 
-from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.records import (
+    TASK_CHECK_NAME,
+    CaseResult,
+    CheckResult,
+    FaultClass,
+    Run,
+    RunManifest,
+    Verdict,
+)
 
 DIGEST_PREFIX: Final = "sha256:"
-TASK_CHECK_NAME: Final = "task"
 _SINGLE_TRIAL: Final = 1
 _VERDICT_VALUES: Final = frozenset(item.value for item in Verdict)
 
@@ -74,8 +81,8 @@ def run_from_report(
     Args:
         report: The report ``Dataset.evaluate`` returned.
         manifest: Metadata of the run that produced the report.
-        tags_of: Derives a case's tags from its report case or task failure. None
-            gives every case no tags.
+        tags_of: Derives a case's tags from its report case or task failure. It must
+            give every trial of a case the same tags. None gives every case no tags.
         fault_of: Classifies who is at fault for a case or task failure, such as
             ``INFRA`` for a timeout.
 
@@ -83,8 +90,9 @@ def run_from_report(
         The run, with results ordered by case id then trial.
 
     Raises:
-        ValueError: The report holds output from report-level evaluators, a case has no
-            name, a case and trial appear twice, a label is not a verdict, or an
+        ValueError: The report holds output from report-level evaluators, an evaluator
+            is named ``task``, a case has no name, a case and trial appear twice,
+            trials of a case carry different tags, a label is not a verdict, or an
             evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
@@ -152,6 +160,11 @@ def _result_from_case(
         CheckResult(name=failure.name, verdict=Verdict.UNVERIFIABLE, detail=failure.error_message)
         for failure in case.evaluator_failures
     )
+    if any(check.name == TASK_CHECK_NAME for check in checks):
+        raise ValueError(
+            f"case {case.name!r}: evaluator name {TASK_CHECK_NAME!r} is reserved for a task "
+            "that raised; rename the evaluator"
+        )
 
     return CaseResult(
         case_id=case_id,

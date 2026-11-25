@@ -1,6 +1,8 @@
 """Tests for converting a Pydantic Evals report into a run."""
 
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,6 +11,7 @@ from pydantic_evals.evaluators import EvaluationReason, EvaluatorContext
 from pydantic_evals.reporting import EvaluationReport
 
 from dfo_evals.checks import verdict
+from dfo_evals.page import build_page
 from dfo_evals.records import FaultClass, RunManifest, Verdict, read_run, write_run
 from dfo_evals.report import TASK_CHECK_NAME, input_digest, run_from_report
 
@@ -52,6 +55,10 @@ def free_text(ctx: EvaluatorContext[Any, int, Any]) -> str:
 
 def closeness(ctx: EvaluatorContext[Any, int, Any]) -> float:
     return 0.5
+
+
+def answer(ctx: EvaluatorContext[Any, int, Any]) -> bool:
+    return ctx.output > 0
 
 
 def crashes(ctx: EvaluatorContext[Any, int, Any]) -> bool:
@@ -102,6 +109,17 @@ def test_a_label_that_is_not_a_verdict_raises_naming_case_and_evaluator():
         run_from_report(report=report, manifest=MANIFEST)
 
 
+def task(ctx: EvaluatorContext[Any, int, Any]) -> bool:
+    return False
+
+
+def test_an_evaluator_named_task_raises_because_the_name_is_reserved():
+    report = evaluate([Case(name="case-a", inputs={"x": 1})], task, is_even)
+
+    with pytest.raises(ValueError, match=r"case 'case-a'.*'task' is reserved"):
+        run_from_report(report=report, manifest=MANIFEST)
+
+
 def test_a_numeric_score_raises():
     report = evaluate([Case(name="case-a", inputs={"x": 1})], closeness)
 
@@ -135,6 +153,21 @@ def test_a_task_that_raises_becomes_a_failing_task_check():
     assert result.duration_s is None
     assert result.fault is None
     assert result.input_digest == input_digest({"x": -1})
+
+
+def test_a_page_with_a_headline_check_builds_and_scores_a_crashed_task_as_a_fail(
+    tmp_path: Path,
+):
+    report = evaluate(
+        [Case(name="ok", inputs={"x": 1}), Case(name="bad", inputs={"x": -1})], answer
+    )
+    write_run(root=tmp_path, run=run_from_report(report=report, manifest=MANIFEST))
+
+    page = build_page(root=tmp_path, headline_checks={MANIFEST.suite: "answer"})
+
+    row = re.search(r'<tr><th scope="row">All cases</th>(.*?)</tr>', page)
+    assert row
+    assert re.findall(r"<td[^>]*>(.*?)</td>", row.group(1))[:2] == ["2", "50.0%"]
 
 
 def test_fault_of_classifies_a_task_that_raised():
@@ -204,6 +237,14 @@ def test_tags_of_is_applied_to_cases_and_task_failures():
         "ok": ("family:share",),
         "broken": ("family:total",),
     }
+
+
+def test_tags_that_differ_between_repeats_raise_before_the_run_is_saved():
+    report = evaluate([Case(name="a", inputs={"x": 1})], is_even, repeat=2)
+    trials = iter((("dac",), ()))
+
+    with pytest.raises(ValueError, match="tags must be the same on every trial"):
+        run_from_report(report=report, manifest=MANIFEST, tags_of=lambda _: next(trials))
 
 
 def test_results_are_ordered_by_case_id_then_trial():

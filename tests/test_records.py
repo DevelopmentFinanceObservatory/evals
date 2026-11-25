@@ -125,9 +125,39 @@ def test_an_empty_check_name_is_rejected() -> None:
         CheckResult(name="", verdict=Verdict.PASS)
 
 
+def test_a_task_check_beside_other_checks_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reserved for a task that raised"):
+        make_case(
+            checks=(
+                CheckResult(name="answer", verdict=Verdict.PASS),
+                CheckResult(name="task", verdict=Verdict.FAIL),
+            )
+        )
+
+
 def test_duplicate_case_and_trial_pairs_are_rejected() -> None:
     with pytest.raises(ValidationError, match="duplicate"):
         Run(manifest=make_manifest(), results=(make_case(), make_case()))
+
+
+def test_trials_of_one_case_with_different_tags_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="case 'case-1' trial 2 has tags"):
+        Run(
+            manifest=make_manifest(),
+            results=(make_case(trial=1, tags=("dac",)), make_case(trial=2, tags=())),
+        )
+
+
+def test_trials_of_one_case_may_list_the_same_tags_in_any_order() -> None:
+    run = Run(
+        manifest=make_manifest(),
+        results=(
+            make_case(trial=1, tags=("dac", "family:share")),
+            make_case(trial=2, tags=("family:share", "dac")),
+        ),
+    )
+
+    assert len(run.results) == 2
 
 
 def test_the_same_case_in_different_trials_is_accepted() -> None:

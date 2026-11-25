@@ -27,6 +27,8 @@ from pydantic import (
 SCHEMA_VERSION: Final = 1
 MANIFEST_FILE: Final = "manifest.json"
 RESULTS_FILE: Final = "results.jsonl"
+# Name of the single FAIL check recorded for a trial whose task raised.
+TASK_CHECK_NAME: Final = "task"
 
 # Run and suite names become directory names, so they must not escape or hide.
 _SAFE_NAME_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -87,7 +89,8 @@ class CaseResult(BaseModel):
         duration_s: Time the task took in seconds, or None when unknown, such as
             for a task that raised.
         cost_usd: Cost of the trial in nominal USD, or None when unknown.
-        tags: Grouping labels such as corpus file or family, used by reports.
+        tags: Grouping labels such as corpus file or family, used by reports. Tags
+            belong to the case, so every trial of a case carries the same set.
     """
 
     model_config = _MODEL_CONFIG
@@ -109,6 +112,21 @@ class CaseResult(BaseModel):
         duplicates = _duplicates(check.name for check in checks)
         if duplicates:
             raise ValueError(f"duplicate check names: {duplicates}")
+        return checks
+
+    @field_validator("checks")
+    @classmethod
+    def _task_check_alone(cls, checks: tuple[CheckResult, ...]) -> tuple[CheckResult, ...]:
+        """Reject a ``task`` check beside other checks.
+
+        The name marks a task that raised, whose trial holds that one check, and scoring
+        fails any trial that carries it.
+        """
+        if len(checks) > 1 and any(check.name == TASK_CHECK_NAME for check in checks):
+            raise ValueError(
+                f"check name {TASK_CHECK_NAME!r} is reserved for a task that raised and "
+                "must be the trial's only check"
+            )
         return checks
 
 
@@ -156,6 +174,25 @@ class Run(BaseModel):
         duplicates = _duplicates((result.case_id, result.trial) for result in results)
         if duplicates:
             raise ValueError(f"duplicate (case_id, trial) pairs: {duplicates}")
+        return results
+
+    @field_validator("results")
+    @classmethod
+    def _tags_per_case(cls, results: tuple[CaseResult, ...]) -> tuple[CaseResult, ...]:
+        """Reject a run whose trials of one case carry different tag sets.
+
+        Reports group cases by tag and count every trial of each member case, so a tag
+        held by only some trials of a case would leave the group without them.
+        """
+        tags_by_case: dict[str, frozenset[str]] = {}
+        for result in results:
+            tags = frozenset(result.tags)
+            first = tags_by_case.setdefault(result.case_id, tags)
+            if tags != first:
+                raise ValueError(
+                    f"case {result.case_id!r} trial {result.trial} has tags {sorted(tags)}, "
+                    f"another trial has {sorted(first)}; tags must be the same on every trial"
+                )
         return results
 
 
