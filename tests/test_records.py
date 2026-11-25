@@ -201,6 +201,11 @@ def test_the_same_case_in_different_trials_is_accepted() -> None:
     assert len(run.results) == 2
 
 
+def test_the_suite_name_the_results_page_takes_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reserved"):
+        make_manifest(suite="site")
+
+
 @pytest.mark.parametrize("run_id", ["", ".hidden", "../escape", "a/b", "has space", "-lead"])
 def test_a_run_id_unsafe_as_a_directory_name_is_rejected(run_id: str) -> None:
     with pytest.raises(ValidationError):

@@ -2,6 +2,13 @@
 
 A run lives in one directory, ``<root>/<suite>/<run_id>/``, holding ``manifest.json``
 (one ``RunManifest``) and ``results.jsonl`` (one ``CaseResult`` per line).
+
+``iter_runs`` reads a directory holding ``manifest.json`` as a complete run, so an
+uploader that copies run files one at a time writes ``results.jsonl`` first and
+``manifest.json`` last. ``write_run`` is atomic on a local disk only.
+
+A suite cannot be named ``site``: the results bucket keeps the page at
+``site/index.html``, beside the suite directories.
 """
 
 import json
@@ -27,6 +34,8 @@ from pydantic import (
 SCHEMA_VERSION: Final = 1
 MANIFEST_FILE: Final = "manifest.json"
 RESULTS_FILE: Final = "results.jsonl"
+# The page lives at <root>/site/index.html, so no suite may take that directory.
+RESERVED_SUITE: Final = "site"
 # Name of the single FAIL check recorded for a trial whose task raised.
 TASK_CHECK_NAME: Final = "task"
 
@@ -161,6 +170,14 @@ class RunManifest(BaseModel):
                 f"headline_check {TASK_CHECK_NAME!r} is reserved for a task that raised"
             )
         return headline_check
+
+    @field_validator("suite")
+    @classmethod
+    def _suite_not_reserved(cls, suite: str) -> str:
+        """Reject the suite name the results page's directory takes."""
+        if suite == RESERVED_SUITE:
+            raise ValueError(f"suite name {RESERVED_SUITE!r} is reserved for the results page")
+        return suite
 
     @model_validator(mode="after")
     def _finished_not_before_started(self) -> Self:

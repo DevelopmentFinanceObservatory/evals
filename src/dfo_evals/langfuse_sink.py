@@ -9,9 +9,8 @@ Langfuse shows one item run per dataset item in an experiment, so a case has one
 run however many trials it ran. Its output holds every trial's result (and the caller's
 output for that trial, if given) in trial order. Each check is scored once per case, as
 the share of the case's trials whose verdict on it is a pass, over the trials that passed
-or failed it: 1.0 or 0.0 for a case run once, as a single-trial suite scores today.
-Unverifiable, n/a and unreached verdicts are left out, and a check no trial passed or
-failed gets no score. Each trial's number, fault, duration, cost, tags, input digest and
+or failed it: 1.0 or 0.0 for a case run once. Unverifiable, n/a and unreached verdicts
+are left out, and a check no trial passed or failed gets no score. Each trial's number, fault, duration, cost, tags, input digest and
 trace id are in the item run's metadata under ``trials``.
 
 The experiment is named ``<suite>/<run_id> <revision> <digest>``, where ``<digest>``
@@ -19,20 +18,18 @@ begins the digest of the run's records and outputs. Pushing the same run again s
 only the cases and scores Langfuse lacks; a different run never shares a name.
 
 Every digest here is taken after whole-number floats become integers, so a store that
-returns ``1.0`` as ``1`` still matches. Langfuse Cloud returned outputs verbatim on
-24 November 2026.
+returns ``1.0`` as ``1`` still matches.
 
-langfuse's ``run_experiment`` (4.14 to 4.18) takes each experiment's id from
-``dataset_run_items.create``, an endpoint the SDK marks for removal from Langfuse Cloud
-on 16 November 2026. It still answered on 24 November 2026. Once it goes, the SDK logs
-"Failed to create dataset run item" for each item and falls back to one random
-experiment id per ``run_experiment`` call: one push still lands as one experiment, but a
-re-push that sends missing cases lands under a second experiment id with the same run
-name. Reading back by experiment name sees both.
+langfuse 5 derives an experiment's id from the project, dataset and run name, so a
+re-push lands in the same experiment. langfuse 4 takes it from the
+``dataset_run_items.create`` endpoint and, when that call fails, falls back to a random
+id per ``run_experiment`` call, so a re-push that sends missing cases can land under a
+second experiment id with the same run name. Reading back by experiment name sees both.
 """
 
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -68,6 +65,9 @@ _NAME_SEPARATOR: Final = ","
 _READ_FIELDS: Final = "core,io,metadata,scores"
 # Scores list_items returns per item run at most; the API caps score_limit at 50.
 _MAX_SCORES: Final = 50
+# Langfuse disables every client, whatever its settings, when this variable is "false".
+_TRACING_ENABLED_ENV: Final = "LANGFUSE_TRACING_ENABLED"
+_TRACING_DISABLED: Final = "false"
 
 # Item-run metadata keys. Every value is a string, as Langfuse stores span attributes.
 _CASE_ID_KEY: Final = "case_id"
@@ -144,7 +144,8 @@ def connect(*, public_key: str, secret_key: str, base_url: str, project_id: str)
         The client.
 
     Raises:
-        ValueError: A credential or the project id is empty.
+        ValueError: A credential or the project id is empty, or
+            ``LANGFUSE_TRACING_ENABLED`` is ``false``, which stops the client sending.
         WrongProjectError: The keys name another project.
     """
     settings = {
@@ -155,13 +156,19 @@ def connect(*, public_key: str, secret_key: str, base_url: str, project_id: str)
     }
     if missing := [name for name, value in settings.items() if not value]:
         raise ValueError(f"Langfuse {', '.join(missing)} must not be empty")
+    if os.environ.get(_TRACING_ENABLED_ENV, "").lower() == _TRACING_DISABLED:
+        raise ValueError(f"{_TRACING_ENABLED_ENV} is false, so Langfuse would receive nothing")
     client = Langfuse(
         public_key=public_key,
         secret_key=secret_key,
         base_url=base_url,
         tracer_provider=TracerProvider(),
     )
-    check_project(client=client, project_id=project_id)
+    try:
+        check_project(client=client, project_id=project_id)
+    except WrongProjectError:
+        client.shutdown()
+        raise
     return client
 
 
@@ -177,8 +184,9 @@ def check_project(*, client: Langfuse, project_id: str) -> None:
     """
     found = [project.id for project in client.api.projects.get().data]
     if found != [project_id]:
+        # The other projects' ids stay out of the message, which public CI logs show.
         raise WrongProjectError(
-            f"the Langfuse keys name project {', '.join(found) or 'none'}, not {project_id}"
+            f"the Langfuse keys name {len(found)} project(s), not {project_id} alone"
         )
 
 
