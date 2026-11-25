@@ -46,10 +46,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
 
-from langfuse import Evaluation, Langfuse
-from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
-from langfuse.experiment import ExperimentItem
-from opentelemetry.sdk.trace import TracerProvider
+try:
+    from langfuse import Evaluation, Langfuse
+    from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
+    from langfuse.experiment import ExperimentItem
+    from opentelemetry.sdk.trace import TracerProvider
+except ModuleNotFoundError as error:
+    raise ModuleNotFoundError(
+        f"dfo_evals.langfuse_sink needs the langfuse extra (dfo-evals[langfuse]): {error}"
+    ) from error
 from pydantic_core import to_jsonable_python
 
 from dfo_evals.records import CaseResult, Run, Verdict

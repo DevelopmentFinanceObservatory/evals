@@ -1,14 +1,20 @@
 [project]
 name = "dfo-evals"
-version = "0.0.0"
+version = "0.1.0"
 description = "Shared eval library for the Development Finance Observatory (DFO)."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "langfuse>=5.2,<6",
-    "opentelemetry-sdk>=1.42",
     "pydantic>=2.10",
     "pydantic-evals>=2.66",
+]
+
+[project.optional-dependencies]
+# dfo_evals.langfuse_sink alone needs these, so a suite that only writes run records
+# and builds the page installs neither.
+langfuse = [
+    "langfuse>=5.2,<6",
+    "opentelemetry-sdk>=1.42",
 ]
 
 [project.scripts]
@@ -20,6 +26,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "dfo-evals[langfuse]",
     "ruff>=0.15.0",
     "ty>=0.0.59",
     "pytest>=9.1.0",
