@@ -14,10 +14,17 @@ from typing import Any, Final
 from pydantic_core import to_jsonable_python
 from pydantic_evals.reporting import EvaluationReport, ReportCase, ReportCaseFailure
 
-from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.records import (
+    TASK_CHECK_NAME,
+    CaseResult,
+    CheckResult,
+    FaultClass,
+    Run,
+    RunManifest,
+    Verdict,
+)
 
 DIGEST_PREFIX: Final = "sha256:"
-TASK_CHECK_NAME: Final = "task"
 _SINGLE_TRIAL: Final = 1
 _VERDICT_VALUES: Final = frozenset(item.value for item in Verdict)
 
@@ -26,6 +33,7 @@ type AnyReportCaseFailure = ReportCaseFailure[Any, Any, Any]
 # Failures carry the same inputs and metadata, so tags can be derived for both.
 type TagsOf = Callable[[AnyReportCase | AnyReportCaseFailure], tuple[str, ...]]
 type FaultOf = Callable[[AnyReportCase | AnyReportCaseFailure], FaultClass | None]
+type TraceOf = Callable[[AnyReportCase | AnyReportCaseFailure], str | None]
 
 
 def input_digest(inputs: object) -> str:
@@ -73,6 +81,7 @@ def run_from_report(
     manifest: RunManifest,
     tags_of: TagsOf | None = None,
     fault_of: FaultOf | None = None,
+    trace_of: TraceOf | None = None,
 ) -> Run:
     """Convert an evaluation report into a run with one result per case and trial.
 
@@ -81,29 +90,46 @@ def run_from_report(
     fails, with no duration.
 
     A case's fault is what ``fault_of`` returns for it. When ``fault_of`` is None or
-    returns None, a case with an evaluator that raised is a grader fault and any other
-    case has no fault.
+    returns None, a case whose headline evaluator raised is a grader fault, since its
+    trial cannot be scored. Another evaluator that raised leaves the case with no fault
+    and its check unverifiable. With no headline check in the manifest every check
+    decides the trial, so any evaluator that raised is a grader fault.
 
     Args:
         report: The report ``Dataset.evaluate`` returned.
-        manifest: Metadata of the run that produced the report.
-        tags_of: Derives a case's tags from its report case or task failure. None
-            gives every case no tags.
+        manifest: Metadata of the run that produced the report, including the
+            headline check that scores it.
+        tags_of: Derives a case's tags from its report case or task failure. It must
+            give every trial of a case the same tags. None gives every case no tags.
         fault_of: Classifies who is at fault for a case or task failure, such as
             ``INFRA`` for a timeout.
+        trace_of: Extracts the trace id of the system under test from a case or task
+            failure, such as one the system returned in its response. None records
+            no trace id. The trace of the Pydantic Evals runner is never recorded,
+            since it identifies the runner and can be empty.
 
     Returns:
         The run, with results ordered by case id then trial.
 
     Raises:
-        ValueError: The report holds output from report-level evaluators, a case has no
-            name, a case and trial appear twice, a label is not a verdict, or an
-            evaluator returned a numeric score.
+        ValueError: The report holds output from report-level evaluators, an evaluator
+            is named ``task``, a case has no name, a case and trial appear twice,
+            trials of a case carry different tags, a case lacks the headline check, a
+            label is not a verdict, or an evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
-    results = [_result_from_case(case, tags_of=tags_of, fault_of=fault_of) for case in report.cases]
+    results = [
+        _result_from_case(
+            case,
+            headline_check=manifest.headline_check,
+            tags_of=tags_of,
+            fault_of=fault_of,
+            trace_of=trace_of,
+        )
+        for case in report.cases
+    ]
     results += [
-        _result_from_failure(failure, tags_of=tags_of, fault_of=fault_of)
+        _result_from_failure(failure, tags_of=tags_of, fault_of=fault_of, trace_of=trace_of)
         for failure in report.failures
     ]
 
@@ -135,7 +161,12 @@ def _reject_report_evaluator_output(report: EvaluationReport[Any, Any, Any]) -> 
 
 
 def _result_from_case(
-    case: AnyReportCase, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+    case: AnyReportCase,
+    *,
+    headline_check: str | None,
+    tags_of: TagsOf | None,
+    fault_of: FaultOf | None,
+    trace_of: TraceOf | None,
 ) -> CaseResult:
     """Convert one successful report case into a case result."""
     case_id, trial = _case_id_and_trial(name=case.name, source_case_name=case.source_case_name)
@@ -165,6 +196,11 @@ def _result_from_case(
         CheckResult(name=failure.name, verdict=Verdict.UNVERIFIABLE, detail=failure.error_message)
         for failure in case.evaluator_failures
     )
+    if any(check.name == TASK_CHECK_NAME for check in checks):
+        raise ValueError(
+            f"case {case.name!r}: evaluator name {TASK_CHECK_NAME!r} is reserved for a task "
+            "that raised; rename the evaluator"
+        )
 
     return CaseResult(
         case_id=case_id,
@@ -174,17 +210,23 @@ def _result_from_case(
         fault=_fault(
             case,
             fault_of=fault_of,
-            default=FaultClass.GRADER if case.evaluator_failures else None,
+            default=FaultClass.GRADER
+            if _grading_failed(case, headline_check=headline_check)
+            else None,
         ),
         duration_s=case.task_duration,
         cost_usd=None,
-        trace_id=case.trace_id,
+        trace_id=trace_of(case) if trace_of is not None else None,
         tags=tags_of(case) if tags_of is not None else (),
     )
 
 
 def _result_from_failure(
-    failure: AnyReportCaseFailure, *, tags_of: TagsOf | None, fault_of: FaultOf | None
+    failure: AnyReportCaseFailure,
+    *,
+    tags_of: TagsOf | None,
+    fault_of: FaultOf | None,
+    trace_of: TraceOf | None,
 ) -> CaseResult:
     """Convert a task that raised into a case result with one failing ``task`` check."""
     case_id, trial = _case_id_and_trial(
@@ -200,9 +242,16 @@ def _result_from_failure(
         fault=_fault(failure, fault_of=fault_of, default=None),
         duration_s=None,
         cost_usd=None,
-        trace_id=failure.trace_id,
+        trace_id=trace_of(failure) if trace_of is not None else None,
         tags=tags_of(failure) if tags_of is not None else (),
     )
+
+
+def _grading_failed(case: AnyReportCase, *, headline_check: str | None) -> bool:
+    """Whether an evaluator that decides the trial raised."""
+    if headline_check is None:
+        return bool(case.evaluator_failures)
+    return any(failure.name == headline_check for failure in case.evaluator_failures)
 
 
 def _fault(

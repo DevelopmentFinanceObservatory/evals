@@ -4,7 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from dfo_evals.records import CaseResult, CheckResult, FaultClass, Run, RunManifest, Verdict
+from dfo_evals.records import (
+    TASK_CHECK_NAME,
+    CaseResult,
+    CheckResult,
+    FaultClass,
+    Run,
+    RunManifest,
+    Verdict,
+)
 from dfo_evals.summary import (
     GroupSummary,
     MissingHeadlineCheckError,
@@ -40,7 +48,12 @@ def make_case(
     )
 
 
-def make_run(*results: CaseResult, run_id: str = "run-1", started_at: datetime = STARTED_AT) -> Run:
+def make_run(
+    *results: CaseResult,
+    run_id: str = "run-1",
+    started_at: datetime = STARTED_AT,
+    headline_check: str | None = HEADLINE,
+) -> Run:
     manifest = RunManifest(
         suite="apis-search",
         run_id=run_id,
@@ -49,6 +62,7 @@ def make_run(*results: CaseResult, run_id: str = "run-1", started_at: datetime =
         revision="abc123",
         environment={},
         dataset_digest="sha256:dataset",
+        headline_check=headline_check,
     )
     return Run(manifest=manifest, results=results)
 
@@ -98,6 +112,37 @@ def test_agent_and_upstream_faults_count_as_fails(fault: FaultClass) -> None:
     assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.FAIL
 
 
+@pytest.mark.parametrize("fault", [FaultClass.AGENT, FaultClass.UPSTREAM])
+def test_agent_and_upstream_faults_fail_a_trial_with_a_passing_headline(
+    fault: FaultClass,
+) -> None:
+    result = make_case(verdicts={HEADLINE: Verdict.PASS}, fault=fault)
+
+    assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.FAIL
+
+
+def test_an_upstream_fault_with_a_passing_headline_is_not_scored_a_success() -> None:
+    run = make_run(make_case(verdicts={HEADLINE: Verdict.PASS}, fault=FaultClass.UPSTREAM))
+
+    summary = summarise_run(run=run)
+
+    assert summary.all_cases.success_rate == 0.0
+
+
+@pytest.mark.parametrize("headline_check", [HEADLINE, None])
+def test_a_crashed_task_fails_without_the_headline_check(headline_check: str | None) -> None:
+    result = make_case(verdicts={TASK_CHECK_NAME: Verdict.FAIL})
+
+    assert trial_outcome(result=result, headline_check=headline_check) is TrialOutcome.FAIL
+
+
+@pytest.mark.parametrize("fault", [FaultClass.GRADER, FaultClass.INFRA, FaultClass.REFERENCE])
+def test_an_excluding_fault_outranks_a_crashed_task(fault: FaultClass) -> None:
+    result = make_case(verdicts={TASK_CHECK_NAME: Verdict.FAIL}, fault=fault)
+
+    assert trial_outcome(result=result, headline_check=HEADLINE) is TrialOutcome.EXCLUDED
+
+
 def test_the_headline_check_alone_decides_the_trial() -> None:
     passing = make_case(verdicts={HEADLINE: Verdict.PASS, "year": Verdict.FAIL})
     failing = make_case(verdicts={HEADLINE: Verdict.UNVERIFIABLE, "year": Verdict.PASS})
@@ -136,7 +181,7 @@ def test_a_run_is_scored_overall_and_per_tag() -> None:
         make_case(case_id="d", verdicts={}, fault=FaultClass.INFRA, tags=("corpus/imf.yaml",)),
     )
 
-    summary = summarise_run(run=run, headline_check=HEADLINE)
+    summary = summarise_run(run=run)
 
     assert summary.all_cases == GroupSummary(
         trials_per_case=1,
@@ -155,24 +200,27 @@ def test_a_run_is_scored_overall_and_per_tag() -> None:
     assert summary.by_tag["corpus/imf.yaml"].excluded_trials == 1
 
 
-def test_a_missing_headline_check_in_a_run_names_the_suite_and_run() -> None:
-    run = make_run(make_case(verdicts={"year": Verdict.PASS}), run_id="night-7")
+def test_a_run_is_scored_by_the_headline_check_its_manifest_names() -> None:
+    case = make_case(verdicts={HEADLINE: Verdict.FAIL, "year": Verdict.PASS})
 
-    with pytest.raises(MissingHeadlineCheckError, match=r"'apis-search' run 'night-7'.*answer"):
-        summarise_run(run=run, headline_check=HEADLINE)
+    by_answer = summarise_run(run=make_run(case))
+    by_year = summarise_run(run=make_run(case, headline_check="year"))
+    by_every_check = summarise_run(run=make_run(case, headline_check=None))
+
+    assert by_answer.all_cases.passes == 0
+    assert by_year.all_cases.passes == 1
+    assert by_every_check.all_cases.passes == 0
 
 
 def test_cases_with_different_trial_counts_raise() -> None:
     run = make_run(make_case(case_id="a", trial=1), make_case(case_id="a", trial=2), make_case())
 
     with pytest.raises(ValueError, match=r"run 'run-1'.*without 2 trials: \['case-1'\]"):
-        summarise_run(run=run, headline_check=HEADLINE)
+        summarise_run(run=run)
 
 
 def test_a_group_with_no_scored_trials_has_no_success_rate() -> None:
-    summary = summarise_run(
-        run=make_run(make_case(verdicts={}, fault=FaultClass.GRADER)), headline_check=HEADLINE
-    )
+    summary = summarise_run(run=make_run(make_case(verdicts={}, fault=FaultClass.GRADER)))
 
     assert summary.all_cases.scored_trials == 0
     assert summary.all_cases.success_rate is None
@@ -180,7 +228,7 @@ def test_a_group_with_no_scored_trials_has_no_success_rate() -> None:
 
 
 def test_a_single_trial_run_has_no_pass_distribution() -> None:
-    summary = summarise_run(run=make_run(make_case()), headline_check=HEADLINE)
+    summary = summarise_run(run=make_run(make_case()))
 
     assert summary.trials_per_case == 1
     assert not summary.multi_trial
@@ -197,7 +245,7 @@ def test_a_multi_trial_run_counts_fully_scored_cases_by_passing_trials() -> None
         *(make_case(case_id="none", trial=t, verdicts=fail) for t in (1, 2, 3)),
     )
 
-    summary = summarise_run(run=run, headline_check=HEADLINE)
+    summary = summarise_run(run=run)
 
     assert summary.multi_trial
     assert summary.all_cases.pass_distribution == (1, 0, 1, 1)
@@ -213,7 +261,7 @@ def test_a_case_with_an_excluded_trial_leaves_the_reliability_counts() -> None:
         *(make_case(case_id="all", trial=t) for t in (1, 2, 3)),
     )
 
-    summary = summarise_run(run=run, headline_check=HEADLINE).all_cases
+    summary = summarise_run(run=run).all_cases
 
     assert summary.cases_with_excluded_trial == 1
     assert summary.cases_passing_all == 1
@@ -259,10 +307,9 @@ def test_a_group_without_a_rate_has_no_change() -> None:
 
 
 def test_runs_are_ordered_by_start_time_not_run_id() -> None:
-    later = summarise_run(run=make_run(make_case(), run_id="a"), headline_check=HEADLINE)
+    later = summarise_run(run=make_run(make_case(), run_id="a"))
     earlier = summarise_run(
-        run=make_run(make_case(), run_id="b", started_at=STARTED_AT - timedelta(days=1)),
-        headline_check=HEADLINE,
+        run=make_run(make_case(), run_id="b", started_at=STARTED_AT - timedelta(days=1))
     )
 
     assert [s.manifest.run_id for s in chronological([later, earlier])] == ["b", "a"]

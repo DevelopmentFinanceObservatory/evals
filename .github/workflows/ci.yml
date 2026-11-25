@@ -24,22 +24,24 @@ on:
         "ci/**",
         "chore/**",
       ]
-    # `edited` is left out on purpose. It would start a run on every title or
-    # body edit, and the concurrency group below would cancel the real suite
-    # that the edit interrupted. The cost is that a stacked PR whose base is
-    # retargeted emits only `edited`, so its required checks wait on "Expected"
-    # until someone re-runs them.
+    # `edited` is the only event a stacked PR emits when its base is
+    # retargeted, and a re-run would test the old merge, so an edit starts a
+    # fresh run. Title and body edits run in a group of their own (see
+    # concurrency) so they never cancel the suite a push started.
     # `ready_for_review` starts the run when a draft is marked ready; the jobs
     # skip while the pull request is a draft.
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
   contents: read
 
 concurrency:
   # Keyed on the PR number for pull_request events, so a PR run never shares a
-  # group with its base branch's push runs.
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # group with its base branch's push runs. An edit that leaves the base alone
+  # gets the `-metadata` suffix, so it cancels only other metadata runs. Those
+  # runs still run every job: a skipped job would report a passing `lint` and
+  # could hide an earlier failure, since the newest check of a name wins.
+  group: ci-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'edited' && !github.event.changes.base && '-metadata' || '' }}
   cancel-in-progress: true
 
 # `just check` covers the lint and test jobs below. Keep the two in sync if
@@ -48,7 +50,8 @@ jobs:
   lint:
     # Runs ruff and ty together, so the single `lint` check fails on a type
     # error too.
-    if: github.event.pull_request.draft != true
+    # `edited` also fires on closed PRs, which need no checks.
+    if: github.event.pull_request.draft != true && github.event.pull_request.state != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -87,7 +90,8 @@ jobs:
   test:
     # Component suites run on 3.12 (apis) and 3.13 (ai), so the library tests
     # on both. The checks report as `test (3.12)` and `test (3.13)`.
-    if: github.event.pull_request.draft != true
+    # `edited` also fires on closed PRs, which need no checks.
+    if: github.event.pull_request.draft != true && github.event.pull_request.state != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -117,7 +121,8 @@ jobs:
   # Consumers pin their own pydantic-ai-slim (ai is on 2.66), and each pydantic-evals
   # release pins pydantic-ai-slim exactly, so the declared lower bounds must work.
   test-lowest:
-    if: github.event.pull_request.draft != true
+    # `edited` also fires on closed PRs, which need no checks.
+    if: github.event.pull_request.draft != true && github.event.pull_request.state != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
