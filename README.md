@@ -13,6 +13,8 @@ tests/           The package's test suite
 
 The package supports Python 3.12 and later. `apis` runs its suites on 3.12 and `ai` on 3.13, and CI tests both.
 
+`dfo_evals.langfuse_sink`, which pushes runs to Langfuse, needs the `langfuse` extra: depend on `dfo-evals[langfuse]`.
+
 ## Getting started
 
 You need [`just`](https://github.com/casey/just) and [`uv`](https://docs.astral.sh/uv/).
