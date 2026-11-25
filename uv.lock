@@ -216,7 +216,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "langfuse", specifier = ">=4.14,<6" },
+    { name = "langfuse", specifier = ">=5.2,<6" },
     { name = "opentelemetry-sdk", specifier = ">=1.42" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-evals", specifier = ">=2.66" },

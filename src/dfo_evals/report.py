@@ -39,9 +39,11 @@ type TraceOf = Callable[[AnyReportCase | AnyReportCaseFailure], str | None]
 def input_digest(inputs: object) -> str:
     """Digest case inputs so a result can be matched to the exact inputs it ran on.
 
-    The inputs are converted to JSON-compatible Python, then serialised with sorted keys
-    and no whitespace, so dict key order does not change the digest. Sets serialise in
-    iteration order, which can differ between processes; pass sorted sequences instead.
+    The inputs are converted to JSON-compatible Python, every whole-number float becomes
+    an int (``1.0`` digests as ``1``, as a JSON store that drops the ``.0`` returns it;
+    bools stay bools), then serialised with sorted keys and no whitespace, so dict key
+    order does not change the digest. Sets serialise in iteration order, which can
+    differ between processes; pass sorted sequences instead.
 
     Args:
         inputs: The case inputs, any value Pydantic can serialise.
@@ -53,13 +55,24 @@ def input_digest(inputs: object) -> str:
         ValueError: The inputs hold a non-finite float.
     """
     canonical = json.dumps(
-        to_jsonable_python(inputs),
+        _whole_floats_as_ints(to_jsonable_python(inputs)),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
     )
     return DIGEST_PREFIX + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _whole_floats_as_ints(value: object) -> object:
+    """Turn every whole-number float in JSON-compatible Python into an int."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _whole_floats_as_ints(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_whole_floats_as_ints(item) for item in value]
+    return value
 
 
 def run_from_report(

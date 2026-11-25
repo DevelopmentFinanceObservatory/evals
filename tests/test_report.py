@@ -246,6 +246,17 @@ def test_input_digest_differs_for_different_inputs():
     assert digest != input_digest({"x": 2})
 
 
+def test_input_digest_reads_whole_floats_as_ints_and_keeps_other_floats():
+    assert input_digest({"x": 1.0}) == input_digest({"x": 1})
+    assert input_digest({"x": 1.5}) != input_digest({"x": 1})
+    assert input_digest({"x": True}) != input_digest({"x": 1})
+
+
+def test_input_digest_refuses_a_non_finite_float():
+    with pytest.raises(ValueError, match="JSON compliant"):
+        input_digest({"x": float("inf")})
+
+
 def test_tags_of_is_applied_to_cases_and_task_failures():
     report = evaluate(
         [
