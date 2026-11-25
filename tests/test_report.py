@@ -140,6 +140,33 @@ def test_an_evaluator_that_raises_becomes_unverifiable_with_a_grader_fault():
     assert result.fault is FaultClass.GRADER
 
 
+def test_a_crash_in_another_check_leaves_a_trial_scored_by_its_headline():
+    report = evaluate([Case(name="a", inputs={"x": 1})], crashes, is_even)
+    manifest = MANIFEST.model_copy(update={"headline_check": "is_even"})
+
+    (result,) = run_from_report(report=report, manifest=manifest).results
+
+    assert by_name(result.checks)["crashes"].verdict is Verdict.UNVERIFIABLE
+    assert result.fault is None
+
+
+def test_a_crash_in_the_headline_check_is_a_grader_fault():
+    report = evaluate([Case(name="a", inputs={"x": 1})], crashes, is_even)
+    manifest = MANIFEST.model_copy(update={"headline_check": "crashes"})
+
+    (result,) = run_from_report(report=report, manifest=manifest).results
+
+    assert result.fault is FaultClass.GRADER
+
+
+def test_a_case_without_the_headline_check_raises():
+    report = evaluate([Case(name="a", inputs={"x": 1})], is_even)
+    manifest = MANIFEST.model_copy(update={"headline_check": "answer"})
+
+    with pytest.raises(ValueError, match=r"case 'a' trial 1 has no headline check 'answer'"):
+        run_from_report(report=report, manifest=manifest)
+
+
 def test_a_task_that_raises_becomes_a_failing_task_check():
     report = evaluate([Case(name="a", inputs={"x": -1})], is_even)
 
@@ -161,9 +188,10 @@ def test_a_page_with_a_headline_check_builds_and_scores_a_crashed_task_as_a_fail
     report = evaluate(
         [Case(name="ok", inputs={"x": 1}), Case(name="bad", inputs={"x": -1})], answer
     )
-    write_run(root=tmp_path, run=run_from_report(report=report, manifest=MANIFEST))
+    manifest = MANIFEST.model_copy(update={"headline_check": "answer"})
+    write_run(root=tmp_path, run=run_from_report(report=report, manifest=manifest))
 
-    page = build_page(root=tmp_path, headline_checks={MANIFEST.suite: "answer"})
+    page = build_page(root=tmp_path)
 
     row = re.search(r'<tr><th scope="row">All cases</th>(.*?)</tr>', page)
     assert row

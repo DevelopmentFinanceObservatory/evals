@@ -8,6 +8,7 @@ import pytest
 
 from dfo_evals.page import (
     CORPUS_CHANGED,
+    HEADLINE_CHANGED,
     HISTORY_LIMIT,
     MINUS_SIGN,
     NO_PREVIOUS,
@@ -32,7 +33,12 @@ IMF = "corpus/imf.yaml"
 
 
 def make_case(
-    *, case_id: str, passed: bool | None, tags: tuple[str, ...], trial: int = 1
+    *,
+    case_id: str,
+    passed: bool | None,
+    tags: tuple[str, ...],
+    trial: int = 1,
+    check: str = "answer",
 ) -> CaseResult:
     """Make a trial; ``passed=None`` makes an infra-excluded trial."""
     verdict = Verdict.PASS if passed else Verdict.FAIL
@@ -40,7 +46,7 @@ def make_case(
         case_id=case_id,
         trial=trial,
         input_digest="sha256:input",
-        checks=(CheckResult(name="answer", verdict=verdict),),
+        checks=(CheckResult(name=check, verdict=verdict),),
         fault=FaultClass.INFRA if passed is None else None,
         duration_s=1.0,
         cost_usd=None,
@@ -55,10 +61,16 @@ def save_run(
     passes: dict[str, list[bool]],
     suite: str = "apis-search",
     dataset_digest: str = "sha256:dataset",
+    headline_check: str | None = None,
 ) -> None:
-    """Write a run on day ``day`` with one case per entry in ``passes[tag]``."""
+    """Write a run on day ``day`` with one case per entry in ``passes[tag]``.
+
+    The headline check defaults to the suite's entry in ``HEADLINES``.
+    """
     results = tuple(
-        make_case(case_id=f"{tag}-{index}", passed=passed, tags=(tag,))
+        make_case(
+            case_id=f"{tag}-{index}", passed=passed, tags=(tag,), check=headline_check or "answer"
+        )
         for tag, outcomes in passes.items()
         for index, passed in enumerate(outcomes)
     )
@@ -70,6 +82,7 @@ def save_run(
         revision=f"rev{day}",
         environment={},
         dataset_digest=dataset_digest,
+        headline_check=headline_check or HEADLINES.get(suite),
     )
     write_run(root=root, run=Run(manifest=manifest, results=results))
 
@@ -89,14 +102,14 @@ def two_runs(tmp_path: Path) -> Path:
 
 
 def test_the_group_table_lists_all_cases_first_then_tags_sorted(two_runs: Path) -> None:
-    page = build_page(root=two_runs, headline_checks=HEADLINES)
+    page = build_page(root=two_runs)
 
     positions = [page.index(f'<th scope="row">{label}</th>') for label in ("All cases", DAC, IMF)]
     assert positions == sorted(positions)
 
 
 def test_group_rows_show_rates_and_signed_change(two_runs: Path) -> None:
-    page = build_page(root=two_runs, headline_checks=HEADLINES)
+    page = build_page(root=two_runs)
 
     assert group_row(page, "All cases") == ["6", "50.0%", "0.0 pp", "0"]
     assert group_row(page, DAC) == ["4", "50.0%", "+25.0 pp", "0"]
@@ -108,7 +121,7 @@ def test_a_group_new_in_the_latest_run_is_marked_new(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True]})
     save_run(tmp_path, day=2, passes={DAC: [True], IMF: [False]})
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert group_row(page, IMF)[2] == NO_PREVIOUS
 
@@ -117,7 +130,7 @@ def test_a_group_with_no_scored_trials_shows_n_a(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: []})
     save_run(tmp_path, day=2, passes={DAC: [True]})
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     first = re.search(r"night-001</code></th>(.*?)</tr>", page)
     second = re.search(r"night-002</code></th>(.*?)</tr>", page)
@@ -131,7 +144,7 @@ def test_a_change_of_corpus_replaces_the_change_with_a_flag(tmp_path: Path) -> N
     save_run(tmp_path, day=1, passes={DAC: [True, False]})
     save_run(tmp_path, day=2, passes={DAC: [True]}, dataset_digest="sha256:smaller")
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert group_row(page, "All cases")[2] == CORPUS_CHANGED
     assert group_row(page, DAC)[2] == CORPUS_CHANGED
@@ -145,7 +158,7 @@ def test_history_is_newest_first_and_capped(tmp_path: Path) -> None:
     for day in range(HISTORY_LIMIT + 2):
         save_run(tmp_path, day=day, passes={DAC: [day % 2 == 0]})
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert f"last {HISTORY_LIMIT} runs, newest first" in page
     history = page[page.index("History of") :]
@@ -159,20 +172,18 @@ def test_history_is_newest_first_and_capped(tmp_path: Path) -> None:
 def test_hostile_tags_are_escaped(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={"<script>alert(1)</script>": [True]})
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert "<script>" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
 
 
 def test_the_page_is_deterministic(two_runs: Path) -> None:
-    assert build_page(root=two_runs, headline_checks=HEADLINES) == build_page(
-        root=two_runs, headline_checks=HEADLINES
-    )
+    assert build_page(root=two_runs) == build_page(root=two_runs)
 
 
 def test_the_page_is_a_self_contained_document(two_runs: Path) -> None:
-    page = build_page(root=two_runs, headline_checks=HEADLINES)
+    page = build_page(root=two_runs)
 
     assert '<html lang="en-GB">' in page
     assert "<title>DFO eval results</title>" in page
@@ -187,7 +198,7 @@ def test_the_page_is_a_self_contained_document(two_runs: Path) -> None:
 def test_a_single_run_history_says_one_run(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True]})
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert "History of apis-search, 1 run, newest first" in page
 
@@ -196,10 +207,10 @@ def test_the_scoring_note_names_the_headline_check_or_every_check(tmp_path: Path
     save_run(tmp_path, day=1, passes={DAC: [True]})
     save_run(tmp_path, day=1, passes={DAC: [True]}, suite="ai-chat")
 
-    page = build_page(root=tmp_path, headline_checks=HEADLINES)
+    page = build_page(root=tmp_path)
 
     assert "headline check <code>answer</code> passes" in page
-    assert "A trial passes when no check fails and at least one passes" in page
+    assert "In the latest run a trial passes when no check fails and at least one passes" in page
     assert page.index("ai-chat") < page.index("apis-search")
 
 
@@ -221,10 +232,11 @@ def test_a_multi_trial_suite_shows_cases_by_passing_trials(tmp_path: Path) -> No
         revision="rev1",
         environment={},
         dataset_digest="sha256:dataset",
+        headline_check="answer",
     )
     write_run(root=tmp_path, run=Run(manifest=manifest, results=results))
 
-    page = build_page(root=tmp_path, headline_checks={"ai-chat": "answer"})
+    page = build_page(root=tmp_path)
 
     assert f"Cases by passing trials (0{RANGE_SEPARATOR}3)" in page
     assert group_row(page, "All cases") == [
@@ -240,10 +252,10 @@ def test_a_multi_trial_suite_shows_cases_by_passing_trials(tmp_path: Path) -> No
 def test_the_cli_writes_the_page(two_runs: Path, tmp_path: Path) -> None:
     out = tmp_path / "site" / "index.html"
 
-    code = main(["--root", str(two_runs), "--out", str(out), "--headline", "apis-search=answer"])
+    code = main(["--root", str(two_runs), "--out", str(out)])
 
     assert code == 0
-    assert out.read_text(encoding="utf-8") == build_page(root=two_runs, headline_checks=HEADLINES)
+    assert out.read_text(encoding="utf-8") == build_page(root=two_runs)
 
 
 def test_the_cli_errors_on_an_empty_root(tmp_path: Path) -> None:
@@ -254,25 +266,11 @@ def test_the_cli_errors_on_an_empty_root(tmp_path: Path) -> None:
         main(["--root", str(root), "--out", str(tmp_path / "index.html")])
 
 
-def test_the_cli_errors_on_a_headline_for_a_suite_with_no_runs(two_runs: Path) -> None:
-    with pytest.raises(
-        ValueError, match=r"no runs: \['apis-serch'\]; suites found: \['apis-search'\]"
-    ):
-        main(
-            [
-                "--root",
-                str(two_runs),
-                "--out",
-                str(two_runs / "x.html"),
-                "--headline",
-                "apis-serch=answer",
-            ]
-        )
+def test_a_change_of_headline_check_is_marked_and_each_run_keeps_its_own(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True, False]})
+    save_run(tmp_path, day=2, passes={DAC: [True, False]}, headline_check="answer_v2")
 
+    page = build_page(root=tmp_path)
 
-@pytest.mark.parametrize("headline", ["apis-search", "=answer", "apis-search=", "a=b=c"])
-def test_the_cli_rejects_a_malformed_headline(tmp_path: Path, headline: str) -> None:
-    with pytest.raises(SystemExit) as raised:
-        main(["--root", str(tmp_path), "--out", str(tmp_path / "x.html"), "--headline", headline])
-
-    assert raised.value.code == 2
+    assert group_row(page, "All cases")[:3] == ["2", "50.0%", HEADLINE_CHANGED]
+    assert "headline check <code>answer_v2</code> passes" in page

@@ -77,12 +77,15 @@ def run_from_report(
     fails, with no duration.
 
     A case's fault is what ``fault_of`` returns for it. When ``fault_of`` is None or
-    returns None, a case with an evaluator that raised is a grader fault and any other
-    case has no fault.
+    returns None, a case whose headline evaluator raised is a grader fault, since its
+    trial cannot be scored. Another evaluator that raised leaves the case with no fault
+    and its check unverifiable. With no headline check in the manifest every check
+    decides the trial, so any evaluator that raised is a grader fault.
 
     Args:
         report: The report ``Dataset.evaluate`` returned.
-        manifest: Metadata of the run that produced the report.
+        manifest: Metadata of the run that produced the report, including the
+            headline check that scores it.
         tags_of: Derives a case's tags from its report case or task failure. It must
             give every trial of a case the same tags. None gives every case no tags.
         fault_of: Classifies who is at fault for a case or task failure, such as
@@ -98,12 +101,18 @@ def run_from_report(
     Raises:
         ValueError: The report holds output from report-level evaluators, an evaluator
             is named ``task``, a case has no name, a case and trial appear twice,
-            trials of a case carry different tags, a label is not a verdict, or an
-            evaluator returned a numeric score.
+            trials of a case carry different tags, a case lacks the headline check, a
+            label is not a verdict, or an evaluator returned a numeric score.
     """
     _reject_report_evaluator_output(report)
     results = [
-        _result_from_case(case, tags_of=tags_of, fault_of=fault_of, trace_of=trace_of)
+        _result_from_case(
+            case,
+            headline_check=manifest.headline_check,
+            tags_of=tags_of,
+            fault_of=fault_of,
+            trace_of=trace_of,
+        )
         for case in report.cases
     ]
     results += [
@@ -141,6 +150,7 @@ def _reject_report_evaluator_output(report: EvaluationReport[Any, Any, Any]) -> 
 def _result_from_case(
     case: AnyReportCase,
     *,
+    headline_check: str | None,
     tags_of: TagsOf | None,
     fault_of: FaultOf | None,
     trace_of: TraceOf | None,
@@ -187,7 +197,9 @@ def _result_from_case(
         fault=_fault(
             case,
             fault_of=fault_of,
-            default=FaultClass.GRADER if case.evaluator_failures else None,
+            default=FaultClass.GRADER
+            if _grading_failed(case, headline_check=headline_check)
+            else None,
         ),
         duration_s=case.task_duration,
         cost_usd=None,
@@ -220,6 +232,13 @@ def _result_from_failure(
         trace_id=trace_of(failure) if trace_of is not None else None,
         tags=tags_of(failure) if tags_of is not None else (),
     )
+
+
+def _grading_failed(case: AnyReportCase, *, headline_check: str | None) -> bool:
+    """Whether an evaluator that decides the trial raised."""
+    if headline_check is None:
+        return bool(case.evaluator_failures)
+    return any(failure.name == headline_check for failure in case.evaluator_failures)
 
 
 def _fault(

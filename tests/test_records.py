@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from dfo_evals.records import (
     SCHEMA_VERSION,
+    TASK_CHECK_NAME,
     CaseResult,
     CheckResult,
     FaultClass,
@@ -158,6 +159,40 @@ def test_trials_of_one_case_may_list_the_same_tags_in_any_order() -> None:
     )
 
     assert len(run.results) == 2
+
+
+def test_the_task_check_cannot_be_the_headline() -> None:
+    with pytest.raises(ValidationError, match="reserved for a task that raised"):
+        make_manifest(headline_check=TASK_CHECK_NAME)
+
+
+def test_a_trial_lacking_the_headline_check_is_rejected_naming_suite_run_and_case() -> None:
+    case = make_case(case_id="case-7", fault=None)
+
+    with pytest.raises(
+        ValidationError, match=r"'apis-search' run 'run-1': case 'case-7' trial 1 .*'answer'"
+    ):
+        Run(manifest=make_manifest(headline_check="answer"), results=(case,))
+
+
+def test_faulted_and_crashed_trials_need_no_headline_check() -> None:
+    crashed = make_case(
+        case_id="crashed",
+        fault=None,
+        checks=(CheckResult(name=TASK_CHECK_NAME, verdict=Verdict.FAIL, detail="boom"),),
+    )
+    faulted = make_case(case_id="faulted", fault=FaultClass.INFRA)
+
+    run = Run(manifest=make_manifest(headline_check="answer"), results=(crashed, faulted))
+
+    assert len(run.results) == 2
+
+
+def test_a_headline_check_round_trips(tmp_path: Path) -> None:
+    case = make_case(fault=None)
+    run = Run(manifest=make_manifest(headline_check="year_match"), results=(case,))
+
+    assert read_run(write_run(root=tmp_path, run=run)) == run
 
 
 def test_the_same_case_in_different_trials_is_accepted() -> None:
