@@ -36,6 +36,8 @@ MANIFEST_FILE: Final = "manifest.json"
 RESULTS_FILE: Final = "results.jsonl"
 # The page lives at <root>/site/index.html, so no suite may take that directory.
 RESERVED_SUITE: Final = "site"
+# Name of the single FAIL check recorded for a trial whose task raised.
+TASK_CHECK_NAME: Final = "task"
 
 # Run and suite names become directory names, so they must not escape or hide.
 _SAFE_NAME_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -96,7 +98,8 @@ class CaseResult(BaseModel):
         duration_s: Time the task took in seconds, or None when unknown, such as
             for a task that raised.
         cost_usd: Cost of the trial in nominal USD, or None when unknown.
-        tags: Grouping labels such as corpus file or family, used by reports.
+        tags: Grouping labels such as corpus file or family, used by reports. Tags
+            belong to the case, so every trial of a case carries the same set.
     """
 
     model_config = _MODEL_CONFIG
@@ -120,12 +123,30 @@ class CaseResult(BaseModel):
             raise ValueError(f"duplicate check names: {duplicates}")
         return checks
 
+    @field_validator("checks")
+    @classmethod
+    def _task_check_alone(cls, checks: tuple[CheckResult, ...]) -> tuple[CheckResult, ...]:
+        """Reject a ``task`` check beside other checks.
+
+        The name marks a task that raised, whose trial holds that one check, and scoring
+        fails any trial that carries it.
+        """
+        if len(checks) > 1 and any(check.name == TASK_CHECK_NAME for check in checks):
+            raise ValueError(
+                f"check name {TASK_CHECK_NAME!r} is reserved for a task that raised and "
+                "must be the trial's only check"
+            )
+        return checks
+
 
 class RunManifest(BaseModel):
     """Metadata describing one run of one suite.
 
     Attributes:
         environment: Settings the run depended on, such as app URL and model.
+        headline_check: Name of the check that decides whether a trial passes, or None
+            for a trial to pass when no check fails and at least one passes. Stored with
+            the run so every later report scores it by the rule it ran under.
     """
 
     model_config = _MODEL_CONFIG
@@ -138,6 +159,17 @@ class RunManifest(BaseModel):
     revision: str
     environment: dict[str, str]
     dataset_digest: str
+    headline_check: NonEmptyStr | None = None
+
+    @field_validator("headline_check")
+    @classmethod
+    def _headline_is_not_the_task_check(cls, headline_check: str | None) -> str | None:
+        """Reject the name reserved for a task that raised."""
+        if headline_check == TASK_CHECK_NAME:
+            raise ValueError(
+                f"headline_check {TASK_CHECK_NAME!r} is reserved for a task that raised"
+            )
+        return headline_check
 
     @field_validator("suite")
     @classmethod
@@ -174,6 +206,52 @@ class Run(BaseModel):
         if duplicates:
             raise ValueError(f"duplicate (case_id, trial) pairs: {duplicates}")
         return results
+
+    @field_validator("results")
+    @classmethod
+    def _tags_per_case(cls, results: tuple[CaseResult, ...]) -> tuple[CaseResult, ...]:
+        """Reject a run whose trials of one case carry different tag sets.
+
+        Reports group cases by tag and count every trial of each member case, so a tag
+        held by only some trials of a case would leave the group without them.
+        """
+        tags_by_case: dict[str, frozenset[str]] = {}
+        for result in results:
+            tags = frozenset(result.tags)
+            first = tags_by_case.setdefault(result.case_id, tags)
+            if tags != first:
+                raise ValueError(
+                    f"case {result.case_id!r} trial {result.trial} has tags {sorted(tags)}, "
+                    f"another trial has {sorted(first)}; tags must be the same on every trial"
+                )
+        return results
+
+    @model_validator(mode="after")
+    def _scored_trials_hold_the_headline(self) -> Self:
+        """Reject a trial the headline check would decide that lacks that check.
+
+        A trial with a fault, or whose task raised, is scored without its headline
+        check, so only the others must hold it.
+        """
+        headline = self.manifest.headline_check
+        if headline is None:
+            return self
+        for result in self.results:
+            if result.fault is not None or task_raised(result):
+                continue
+            if all(check.name != headline for check in result.checks):
+                raise ValueError(
+                    f"suite {self.manifest.suite!r} run {self.manifest.run_id!r}: case "
+                    f"{result.case_id!r} trial {result.trial} has no headline check {headline!r}"
+                )
+        return self
+
+
+def task_raised(result: CaseResult) -> bool:
+    """Whether the trial's task raised, recorded as a FAIL ``task`` check."""
+    return any(
+        check.name == TASK_CHECK_NAME and check.verdict is Verdict.FAIL for check in result.checks
+    )
 
 
 def write_run(*, root: Path, run: Run) -> Path:
