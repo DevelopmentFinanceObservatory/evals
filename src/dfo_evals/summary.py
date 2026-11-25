@@ -7,8 +7,9 @@ Scoring rules, applied to each trial in this order:
 2. A trial whose fault is agent or upstream fails, whatever its checks say.
 3. A trial whose task raised, recorded as a FAIL ``task`` check, fails.
 4. Otherwise a trial passes when its headline verdict is PASS and fails otherwise. The
-   headline verdict is the named headline check's verdict; with no headline check, a
-   trial passes when no check is FAIL and at least one check is PASS.
+   headline verdict is the verdict of the check the run's manifest names as headline;
+   with no headline check, a trial passes when no check is FAIL and at least one check
+   is PASS.
 
 A case with any excluded trial is left out of the per-case reliability counts, since
 its remaining trials cannot show whether it passes every time.
@@ -21,12 +22,12 @@ from enum import StrEnum
 from typing import Final
 
 from dfo_evals.records import (
-    TASK_CHECK_NAME,
     CaseResult,
     FaultClass,
     Run,
     RunManifest,
     Verdict,
+    task_raised,
 )
 
 EXCLUDED_FAULTS: Final = frozenset({FaultClass.GRADER, FaultClass.INFRA, FaultClass.REFERENCE})
@@ -250,7 +251,7 @@ def trial_outcome(*, result: CaseResult, headline_check: str | None) -> TrialOut
     """
     if result.fault in EXCLUDED_FAULTS:
         return TrialOutcome.EXCLUDED
-    if result.fault in FAILING_FAULTS or _task_raised(result):
+    if result.fault in FAILING_FAULTS or task_raised(result):
         return TrialOutcome.FAIL
     if headline_passes(result=result, headline_check=headline_check):
         return TrialOutcome.PASS
@@ -300,21 +301,20 @@ def summarise_group(
     )
 
 
-def summarise_run(*, run: Run, headline_check: str | None) -> RunSummary:
-    """Score a run as a whole and per tag.
+def summarise_run(*, run: Run) -> RunSummary:
+    """Score a run as a whole and per tag, by the headline check its manifest names.
 
     Args:
         run: The run to score.
-        headline_check: Name of the suite's headline check, or None.
 
     Returns:
         The run's scores.
 
     Raises:
-        MissingHeadlineCheckError: A scored trial has no headline check.
         ValueError: Cases in the run have different numbers of trials.
     """
     where = f"suite {run.manifest.suite!r} run {run.manifest.run_id!r}"
+    headline_check = run.manifest.headline_check
     trials_per_case = max(
         Counter(result.case_id for result in run.results).values(), default=_SINGLE_TRIAL
     )
@@ -322,11 +322,8 @@ def summarise_run(*, run: Run, headline_check: str | None) -> RunSummary:
     all_outcomes: list[tuple[str, TrialOutcome]] = []
     tag_outcomes: defaultdict[str, list[tuple[str, TrialOutcome]]] = defaultdict(list)
     for result in run.results:
-        try:
-            outcome = trial_outcome(result=result, headline_check=headline_check)
-        except MissingHeadlineCheckError as error:
-            raise MissingHeadlineCheckError(f"{where}: {error}") from error
-        pair = (result.case_id, outcome)
+        # Run rejects a trial lacking its headline check, so this cannot raise.
+        pair = (result.case_id, trial_outcome(result=result, headline_check=headline_check))
         all_outcomes.append(pair)
         for tag in dict.fromkeys(result.tags):
             tag_outcomes[tag].append(pair)
@@ -389,13 +386,6 @@ def chronological(summaries: Iterable[RunSummary]) -> list[RunSummary]:
     if len(suites) > 1:
         raise ValueError(f"summaries span several suites: {sorted(suites)}")
     return ordered
-
-
-def _task_raised(result: CaseResult) -> bool:
-    """Whether the trial's task raised, recorded as a FAIL task check."""
-    return any(
-        check.name == TASK_CHECK_NAME and check.verdict is Verdict.FAIL for check in result.checks
-    )
 
 
 def _share(part: int, whole: int) -> float | None:

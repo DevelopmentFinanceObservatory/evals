@@ -135,6 +135,9 @@ class RunManifest(BaseModel):
 
     Attributes:
         environment: Settings the run depended on, such as app URL and model.
+        headline_check: Name of the check that decides whether a trial passes, or None
+            for a trial to pass when no check fails and at least one passes. Stored with
+            the run so every later report scores it by the rule it ran under.
     """
 
     model_config = _MODEL_CONFIG
@@ -147,6 +150,17 @@ class RunManifest(BaseModel):
     revision: str
     environment: dict[str, str]
     dataset_digest: str
+    headline_check: NonEmptyStr | None = None
+
+    @field_validator("headline_check")
+    @classmethod
+    def _headline_is_not_the_task_check(cls, headline_check: str | None) -> str | None:
+        """Reject the name reserved for a task that raised."""
+        if headline_check == TASK_CHECK_NAME:
+            raise ValueError(
+                f"headline_check {TASK_CHECK_NAME!r} is reserved for a task that raised"
+            )
+        return headline_check
 
     @model_validator(mode="after")
     def _finished_not_before_started(self) -> Self:
@@ -194,6 +208,33 @@ class Run(BaseModel):
                     f"another trial has {sorted(first)}; tags must be the same on every trial"
                 )
         return results
+
+    @model_validator(mode="after")
+    def _scored_trials_hold_the_headline(self) -> Self:
+        """Reject a trial the headline check would decide that lacks that check.
+
+        A trial with a fault, or whose task raised, is scored without its headline
+        check, so only the others must hold it.
+        """
+        headline = self.manifest.headline_check
+        if headline is None:
+            return self
+        for result in self.results:
+            if result.fault is not None or task_raised(result):
+                continue
+            if all(check.name != headline for check in result.checks):
+                raise ValueError(
+                    f"suite {self.manifest.suite!r} run {self.manifest.run_id!r}: case "
+                    f"{result.case_id!r} trial {result.trial} has no headline check {headline!r}"
+                )
+        return self
+
+
+def task_raised(result: CaseResult) -> bool:
+    """Whether the trial's task raised, recorded as a FAIL ``task`` check."""
+    return any(
+        check.name == TASK_CHECK_NAME and check.verdict is Verdict.FAIL for check in result.checks
+    )
 
 
 def write_run(*, root: Path, run: Run) -> Path:
