@@ -26,6 +26,12 @@ just check   # lint, type check, and tests, as CI runs them
 
 `just` lists every recipe.
 
+## Eval results
+
+The `Publish eval results` workflow on `dev` builds the report daily from the complete runs in the dev bucket. Dispatch the workflow from `dev` to refresh it on demand.
+
+Open the [eval results page](https://storage.cloud.google.com/dfo-dev-eval-runs-dev-fin-observatory/site/index.html) with a Google account that has access to the bucket. The [infra runbook](https://github.com/DevelopmentFinanceObservatory/infra/blob/dev/infra/dfo-dev/apis/README.md#eval-runs) describes how to grant access.
+
 ## Contributing
 
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
