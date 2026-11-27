@@ -287,7 +287,8 @@ def _experiment_id(*, project_id: str, dataset_id: str, run_name: str) -> str:
 def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemSpec]) -> list[str]:
     """Write each item to a dataset where Langfuse lacks it or holds it differently.
 
-    Creates the dataset if it is missing. An archived item is written again as active.
+    Creates the dataset if it is missing. Langfuse's ``get_dataset`` returns active items
+    only, so an archived item reads as missing and is written again as active.
     A ``None`` field keeps the stored value, so it never counts as a difference.
     Values compare by digest, whole-number floats as ints, as Langfuse may return them.
 
