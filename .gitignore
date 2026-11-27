@@ -29,6 +29,10 @@ htmlcov/
 .ruff_cache/
 .ty_cache/
 
+# Local tool state
+/.codegraph
+.playwright-mcp/
+
 # AI
 .claude/
 CLAUDE.md
