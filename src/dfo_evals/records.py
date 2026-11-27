@@ -9,6 +9,10 @@ uploader that copies run files one at a time writes ``results.jsonl`` first and
 
 A suite cannot be named ``site``: the results bucket keeps the page at
 ``site/index.html``, beside the suite directories.
+
+Readers refuse a field they do not know, so a record format that gains a field, even an
+optional one, takes a new ``SCHEMA_VERSION``. A reader refuses a run of another version
+with ``RecordSchemaError``, and the results page lists that run as unreadable.
 """
 
 import json
@@ -171,6 +175,14 @@ class RunManifest(BaseModel):
             )
         return headline_check
 
+    @field_validator("revision")
+    @classmethod
+    def _revision_has_no_comma(cls, revision: str) -> str:
+        """Reject a comma, which Langfuse reads as a list separator in experiment names."""
+        if "," in revision:
+            raise ValueError(f"revision {revision!r} holds a comma")
+        return revision
+
     @field_validator("suite")
     @classmethod
     def _suite_not_reserved(cls, suite: str) -> str:
@@ -224,6 +236,21 @@ class Run(BaseModel):
                     f"case {result.case_id!r} trial {result.trial} has tags {sorted(tags)}, "
                     f"another trial has {sorted(first)}; tags must be the same on every trial"
                 )
+        return results
+
+    @field_validator("results")
+    @classmethod
+    def _same_trial_count_per_case(cls, results: tuple[CaseResult, ...]) -> tuple[CaseResult, ...]:
+        """Reject a run whose cases hold different numbers of trials.
+
+        Summaries divide by one trial count for the whole run, so an interrupted or
+        merged run with uneven cases would save and then fail every report.
+        """
+        counts = Counter(result.case_id for result in results)
+        if len(set(counts.values())) > 1:
+            raise ValueError(
+                f"cases hold different numbers of trials: {dict(sorted(counts.items()))}"
+            )
         return results
 
     @model_validator(mode="after")
