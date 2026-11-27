@@ -9,12 +9,13 @@ import argparse
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from typing import Final
 
-from dfo_evals.records import iter_runs, read_run
+from dfo_evals.records import RecordSchemaError, iter_runs, read_run
 from dfo_evals.summary import (
     PERCENT_DECIMALS,
     GroupSummary,
@@ -39,6 +40,7 @@ CORPUS_CHANGED: Final = "corpus changed"
 # A change cell whose previous run named another headline check, so its trials passed
 # by another rule.
 HEADLINE_CHANGED: Final = "headline changed"
+UNREADABLE_HEADING: Final = "Unreadable runs"
 MINUS_SIGN: Final = "\N{MINUS SIGN}"
 RANGE_SEPARATOR: Final = "\N{EN DASH}"
 DISTRIBUTION_SEPARATOR: Final = " \N{MIDDLE DOT} "
@@ -94,25 +96,46 @@ footer { margin-top: 2rem; border-top: 1px solid var(--rule); padding-top: 0.5re
 """
 
 
-def build_page(*, root: Path) -> str:
+@dataclass(frozen=True)
+class Page:
+    """A built results page and the runs it left out, as ``<suite>/<run_id>``."""
+
+    html: str
+    unreadable: tuple[str, ...]
+
+
+def build_page(*, root: Path) -> Page:
     """Build the results page from every run under a root.
 
     Args:
         root: Directory holding ``<suite>/<run_id>/`` run records.
 
+    A run that fails to read, such as one of another schema version or one missing its
+    results file, is left out and listed at the end of the page, so one bad run leaves
+    every other run on the page. The log names it by suite and run directory only, since
+    a validation error can quote record contents. Callers report a page that left runs
+    out as a failure once it is written.
+
     Returns:
-        One self-contained HTML document.
+        One self-contained HTML document and the runs it left out.
 
     Raises:
-        ValueError: The root holds no runs.
+        ValueError: The root holds no readable runs.
         FileNotFoundError: The root does not exist.
     """
     by_suite: defaultdict[str, list[RunSummary]] = defaultdict(list)
+    unreadable: list[str] = []
     for run_dir in iter_runs(root=root):
-        run = read_run(run_dir)
+        try:
+            run = read_run(run_dir)
+        except (RecordSchemaError, FileNotFoundError) as error:
+            name = f"{run_dir.parent.name}/{run_dir.name}"
+            logger.warning("left out unreadable run %s (%s)", name, type(error).__name__)
+            unreadable.append(name)
+            continue
         by_suite[run.manifest.suite].append(summarise_run(run=run))
     if not by_suite:
-        raise ValueError(f"no runs found under {root}")
+        raise ValueError(f"no readable runs under {root}; unreadable: {unreadable}")
     logger.info(
         "read %d runs across %d suites",
         sum(len(runs) for runs in by_suite.values()),
@@ -123,7 +146,22 @@ def build_page(*, root: Path) -> str:
         _suite_section(suite=suite, runs=chronological(by_suite[suite]))
         for suite in sorted(by_suite)
     ]
-    return _document("\n".join(sections))
+    if unreadable:
+        sections.append(_unreadable_section(unreadable))
+    return Page(html=_document("\n".join(sections)), unreadable=tuple(unreadable))
+
+
+def _unreadable_section(names: Sequence[str]) -> str:
+    """List the runs left out because they failed to read."""
+    items = "".join(f"<li><code>{escape(name)}</code></li>" for name in names)
+    return (
+        "<section>"
+        f"<h2>{escape(UNREADABLE_HEADING)}</h2>"
+        '<p class="note">These runs failed to read with this version of dfo-evals and are '
+        "left out of the tables above.</p>"
+        f"<ul>{items}</ul>"
+        "</section>"
+    )
 
 
 def format_rate(rate: float | None) -> str:
@@ -369,7 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Command-line arguments, or None for ``sys.argv``.
 
     Returns:
-        Process exit code, 0 on success.
+        Process exit code: 0 on success, 1 when the page left out unreadable runs.
 
     Raises:
         ValueError: The root holds no runs.
@@ -380,8 +418,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     page = build_page(root=args.root)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(page)
+        handle.write(page.html)
     logger.info("wrote %s", args.out)
+    if page.unreadable:
+        logger.error("the page left out unreadable runs: %s", ", ".join(page.unreadable))
+        return 1
     return 0
 
 

@@ -17,6 +17,7 @@ from dfo_evals.langfuse_sink import (
     PushTimeoutError,
     UnknownCaseError,
     WrongProjectError,
+    _read_back_input_matches,
     check_project,
     connect,
     push_run,
@@ -46,8 +47,8 @@ class _FakeLangfuse:
     derived from the project, dataset id and run name, as langfuse 5 derives it. The
     tasks of the next `failed_tasks` items raise: as in the SDK, they leave no item run
     and no item result.
-    `api.experiments.list_items` reads one experiment's item runs back newest first, in one
-    dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs
+    `api.experiments.list_items` reads one experiment's item runs back newest first, by
+    name and, when given, by experiment id, in one dataset when given its id, `_PAGE` to a page, with whole-number floats in outputs
     written as ints, as JavaScript writes JSON. Item runs start at `now`.
     `scores` holds every score as Langfuse stores it, one per id and timestamp, so a
     score written twice under one id and timestamp is overwritten and any other second
@@ -251,6 +252,7 @@ class _FakeLangfuse:
         score_limit: int,
         cursor: str | None,
         dataset_id: str | None = None,
+        experiment_id: str | None = None,
         **_: Any,
     ) -> Any:
         assert from_start_time == _STARTED
@@ -261,7 +263,9 @@ class _FakeLangfuse:
         shown = [
             run
             for run in reversed(self.runs)
-            if run["experiment"] == experiment_name and dataset_id in (None, run["dataset_id"])
+            if run["experiment"] == experiment_name
+            and dataset_id in (None, run["dataset_id"])
+            and experiment_id in (None, run["experiment_id"])
         ]
         start = int(cursor or 0)
         page = shown[start : start + _PAGE]
@@ -1014,3 +1018,38 @@ def test_verify_pushed_raises_on_timeout_when_langfuse_never_shows_the_scores(
         _verify(fake, _TWO_CASES, name, timeout_s=0.1)
 
     assert sleeps == [pytest.approx(0.1), pytest.approx(0.05)]
+
+
+def test_item_runs_of_another_experiment_under_the_same_name_are_left_out_of_the_read_back() -> (
+    None
+):
+    fake = _with_items("a", "b")
+    name = _push(fake, _TWO_CASES)
+    stray = dict(fake.runs[0], experiment_id="another-experiment")
+    stray["metadata"] = dict(stray["metadata"], case_id="not-in-this-run")
+    fake.runs.append(stray)
+
+    _verify(fake, _TWO_CASES, name, timeout_s=0)
+
+
+@pytest.mark.parametrize("read_back", ["2024", '"2024"'])
+def test_a_string_input_matches_read_back_as_itself_or_as_json_text(read_back: str) -> None:
+    """Langfuse may return a string input as the string or as JSON text."""
+    assert _read_back_input_matches(read_back, input_digest("2024"))
+
+
+def test_a_push_and_a_verify_each_look_up_the_project_once_however_long_they_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dfo_evals.langfuse_sink.time.sleep", lambda _: None)
+    fake = _with_items("a", "b")
+    lookups: list[None] = []
+    get = fake.api.projects.get
+    fake.api.projects.get = lambda: lookups.append(None) or get()
+    fake.hidden_reads = 3
+
+    name = _push(fake, _TWO_CASES, timeout_s=60)
+    fake.hidden_reads = 2
+    _verify(fake, _TWO_CASES, name, timeout_s=60)
+
+    assert len(lookups) == 2

@@ -13,6 +13,7 @@ from dfo_evals.page import (
     MINUS_SIGN,
     NO_PREVIOUS,
     RANGE_SEPARATOR,
+    UNREADABLE_HEADING,
     build_page,
     main,
 )
@@ -102,14 +103,14 @@ def two_runs(tmp_path: Path) -> Path:
 
 
 def test_the_group_table_lists_all_cases_first_then_tags_sorted(two_runs: Path) -> None:
-    page = build_page(root=two_runs)
+    page = build_page(root=two_runs).html
 
     positions = [page.index(f'<th scope="row">{label}</th>') for label in ("All cases", DAC, IMF)]
     assert positions == sorted(positions)
 
 
 def test_group_rows_show_rates_and_signed_change(two_runs: Path) -> None:
-    page = build_page(root=two_runs)
+    page = build_page(root=two_runs).html
 
     assert group_row(page, "All cases") == ["6", "50.0%", "0.0 pp", "0"]
     assert group_row(page, DAC) == ["4", "50.0%", "+25.0 pp", "0"]
@@ -121,7 +122,7 @@ def test_a_group_new_in_the_latest_run_is_marked_new(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True]})
     save_run(tmp_path, day=2, passes={DAC: [True], IMF: [False]})
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert group_row(page, IMF)[2] == NO_PREVIOUS
 
@@ -130,7 +131,7 @@ def test_a_group_with_no_scored_trials_shows_n_a(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: []})
     save_run(tmp_path, day=2, passes={DAC: [True]})
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     first = re.search(r"night-001</code></th>(.*?)</tr>", page)
     second = re.search(r"night-002</code></th>(.*?)</tr>", page)
@@ -144,7 +145,7 @@ def test_a_change_of_corpus_replaces_the_change_with_a_flag(tmp_path: Path) -> N
     save_run(tmp_path, day=1, passes={DAC: [True, False]})
     save_run(tmp_path, day=2, passes={DAC: [True]}, dataset_digest="sha256:smaller")
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert group_row(page, "All cases")[2] == CORPUS_CHANGED
     assert group_row(page, DAC)[2] == CORPUS_CHANGED
@@ -158,7 +159,7 @@ def test_history_is_newest_first_and_capped(tmp_path: Path) -> None:
     for day in range(HISTORY_LIMIT + 2):
         save_run(tmp_path, day=day, passes={DAC: [day % 2 == 0]})
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert f"last {HISTORY_LIMIT} runs, newest first" in page
     history = page[page.index("History of") :]
@@ -172,18 +173,18 @@ def test_history_is_newest_first_and_capped(tmp_path: Path) -> None:
 def test_hostile_tags_are_escaped(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={"<script>alert(1)</script>": [True]})
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert "<script>" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
 
 
 def test_the_page_is_deterministic(two_runs: Path) -> None:
-    assert build_page(root=two_runs) == build_page(root=two_runs)
+    assert build_page(root=two_runs).html == build_page(root=two_runs).html
 
 
 def test_the_page_is_a_self_contained_document(two_runs: Path) -> None:
-    page = build_page(root=two_runs)
+    page = build_page(root=two_runs).html
 
     assert '<html lang="en-GB">' in page
     assert "<title>DFO eval results</title>" in page
@@ -198,7 +199,7 @@ def test_the_page_is_a_self_contained_document(two_runs: Path) -> None:
 def test_a_single_run_history_says_one_run(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True]})
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert "History of apis-search, 1 run, newest first" in page
 
@@ -207,7 +208,7 @@ def test_the_scoring_note_names_the_headline_check_or_every_check(tmp_path: Path
     save_run(tmp_path, day=1, passes={DAC: [True]})
     save_run(tmp_path, day=1, passes={DAC: [True]}, suite="ai-chat")
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert "headline check <code>answer</code> passes" in page
     assert "In the latest run a trial passes when no check fails and at least one passes" in page
@@ -236,7 +237,7 @@ def test_a_multi_trial_suite_shows_cases_by_passing_trials(tmp_path: Path) -> No
     )
     write_run(root=tmp_path, run=Run(manifest=manifest, results=results))
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert f"Cases by passing trials (0{RANGE_SEPARATOR}3)" in page
     assert group_row(page, "All cases") == [
@@ -255,14 +256,14 @@ def test_the_cli_writes_the_page(two_runs: Path, tmp_path: Path) -> None:
     code = main(["--root", str(two_runs), "--out", str(out)])
 
     assert code == 0
-    assert out.read_text(encoding="utf-8") == build_page(root=two_runs)
+    assert out.read_text(encoding="utf-8") == build_page(root=two_runs).html
 
 
 def test_the_cli_errors_on_an_empty_root(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     root.mkdir()
 
-    with pytest.raises(ValueError, match="no runs found"):
+    with pytest.raises(ValueError, match="no readable runs"):
         main(["--root", str(root), "--out", str(tmp_path / "index.html")])
 
 
@@ -270,7 +271,42 @@ def test_a_change_of_headline_check_is_marked_and_each_run_keeps_its_own(tmp_pat
     save_run(tmp_path, day=1, passes={DAC: [True, False]})
     save_run(tmp_path, day=2, passes={DAC: [True, False]}, headline_check="answer_v2")
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     assert group_row(page, "All cases")[:3] == ["2", "50.0%", HEADLINE_CHANGED]
     assert "headline check <code>answer_v2</code> passes" in page
+
+
+def test_an_unreadable_run_is_listed_and_every_other_run_is_shown(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True]})
+    save_run(tmp_path, day=1, passes={DAC: [True]}, suite="other")
+    manifest = tmp_path / "other" / "night-001" / "manifest.json"
+    manifest.write_text(manifest.read_text().replace('"revision"', '"added_field": 1, "revision"'))
+
+    built = build_page(root=tmp_path)
+    page = built.html
+
+    assert built.unreadable == ("other/night-001",)
+    assert 'id="suite-apis-search"' in page
+    assert 'id="suite-other"' not in page
+    assert f"<h2>{UNREADABLE_HEADING}</h2>" in page
+    assert "<li><code>other/night-001</code></li>" in page
+
+
+def test_a_root_of_only_unreadable_runs_raises_naming_them(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True]})
+    (tmp_path / "apis-search" / "night-001" / "results.jsonl").unlink()
+
+    with pytest.raises(ValueError, match="apis-search/night-001"):
+        build_page(root=tmp_path)
+
+
+def test_the_cli_writes_the_page_and_fails_when_it_left_a_run_out(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    save_run(root, day=1, passes={DAC: [True]})
+    save_run(root, day=2, passes={DAC: [True]})
+    (root / "apis-search" / "night-002" / "results.jsonl").unlink()
+    out = tmp_path / "index.html"
+
+    assert main(["--root", str(root), "--out", str(out)]) == 1
+    assert "<li><code>apis-search/night-002</code></li>" in out.read_text(encoding="utf-8")

@@ -191,7 +191,7 @@ def test_a_page_with_a_headline_check_builds_and_scores_a_crashed_task_as_a_fail
     manifest = MANIFEST.model_copy(update={"headline_check": "answer"})
     write_run(root=tmp_path, run=run_from_report(report=report, manifest=manifest))
 
-    page = build_page(root=tmp_path)
+    page = build_page(root=tmp_path).html
 
     row = re.search(r'<tr><th scope="row">All cases</th>(.*?)</tr>', page)
     assert row

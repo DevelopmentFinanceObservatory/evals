@@ -7,6 +7,7 @@ import pytest
 from google.api_core.exceptions import NotFound
 
 from dfo_evals import publish
+from dfo_evals.page import Page
 
 
 def _blob(name: str, content: str = "") -> Mock:
@@ -34,10 +35,10 @@ def test_downloads_complete_runs_and_publishes_only_the_page(tmp_path, monkeypat
         assert sorted(root.rglob("*.json*")) == [run / "manifest.json", run / "results.jsonl"]
         assert (run / "manifest.json").read_text(encoding="utf-8") == "manifest"
         assert (run / "results.jsonl").read_text(encoding="utf-8") == "results"
-        return "<html>report</html>"
+        return Page(html="<html>report</html>", unreadable=())
 
     monkeypatch.setattr(publish, "build_page", build_page)
-    publish.publish(bucket=bucket, root=tmp_path)
+    assert publish.publish(bucket=bucket, root=tmp_path) == ()
 
     assert page.cache_control == "private, no-store"
     page.upload_from_string.assert_called_once_with(
@@ -54,3 +55,26 @@ def test_leaves_the_page_untouched_if_a_committed_records_file_is_missing(tmp_pa
         publish.publish(bucket=bucket, root=tmp_path)
 
     bucket.blob.assert_called_once_with("apis-search/nightly-1/results.jsonl")
+
+
+@pytest.mark.parametrize(("unreadable", "code"), [((), 0), (("apis-search/nightly-2",), 1)])
+def test_main_publishes_and_fails_when_the_page_left_runs_out(
+    monkeypatch, caplog, unreadable, code
+):
+    monkeypatch.setattr(publish.storage, "Client", Mock())
+    monkeypatch.setattr(publish, "publish", lambda *, bucket, root: unreadable)
+
+    assert publish.main(["--bucket", "bucket"]) == code
+    assert ("apis-search/nightly-2" in caplog.text) == bool(unreadable)
+
+
+def test_publish_returns_the_runs_the_page_left_out(tmp_path, monkeypatch):
+    bucket = Mock()
+    bucket.list_blobs.return_value = []
+    left_out = ("apis-search/nightly-2",)
+    monkeypatch.setattr(
+        publish, "build_page", lambda *, root: Page(html="<html></html>", unreadable=left_out)
+    )
+
+    assert publish.publish(bucket=bucket, root=tmp_path) == left_out
+    bucket.blob.return_value.upload_from_string.assert_called_once()

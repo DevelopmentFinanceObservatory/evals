@@ -149,6 +149,23 @@ def test_trials_of_one_case_with_different_tags_are_rejected() -> None:
         )
 
 
+def test_cases_with_different_numbers_of_trials_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="different numbers of trials"):
+        Run(
+            manifest=make_manifest(),
+            results=(
+                make_case(case_id="a", trial=1),
+                make_case(case_id="a", trial=2),
+                make_case(case_id="b", trial=1),
+            ),
+        )
+
+
+def test_a_revision_holding_a_comma_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="holds a comma"):
+        make_manifest(revision="abc,dirty")
+
+
 def test_trials_of_one_case_may_list_the_same_tags_in_any_order() -> None:
     run = Run(
         manifest=make_manifest(),

@@ -32,6 +32,11 @@ Langfuse 5 derives from the project, dataset and run name, so pushing the same r
 lands in the same experiment and sends only the cases and scores Langfuse lacks. A different run never
 shares a name. Every digest here is taken after whole-number floats become integers, so
 a store that returns ``1.0`` as ``1`` still matches.
+
+The run name's format, the item run metadata keys and the namespaces the experiment and
+score ids derive from are fixed. Experiments already in Langfuse were written under
+them, and a change would make a later push of the same run create a second experiment
+and second scores.
 """
 
 import hashlib
@@ -414,8 +419,14 @@ def push_run(
         case_id: _case_output(case_id, results, outputs) for case_id, results in by_case.items()
     }
 
+    project_id = _sole_project_id(client)
     held = _read_pushed(
-        client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+        client=client,
+        run=run,
+        run_name=run_name,
+        groups=groups,
+        project_id=project_id,
+        input_digests=input_digests,
     )
     for case_id, item_run in held.items():
         if item_run.case_digest != _case_digest(by_case[case_id]):
@@ -428,7 +439,6 @@ def push_run(
             )
 
     pending = [case_id for case_id in by_case if case_id not in held]
-    project_id = _sole_project_id(client)
     for group in groups:
         if not (sending := [case_id for case_id in group.items if case_id not in held]):
             continue
@@ -466,6 +476,7 @@ def push_run(
             run=run,
             run_name=run_name,
             groups=groups,
+            project_id=project_id,
             input_digests=input_digests,
             timeout_s=timeout_s,
             cases_only=True,
@@ -498,6 +509,7 @@ def push_run(
         run=run,
         run_name=run_name,
         groups=groups,
+        project_id=project_id,
         input_digests=input_digests,
         timeout_s=max(0.0, deadline - time.monotonic()),
     )
@@ -533,6 +545,7 @@ def verify_pushed(
 
     Raises:
         UnknownCaseError: A case has no item in the dataset it maps to.
+        WrongProjectError: The client's keys name no project or more than one.
         InputMismatchError: A case's item input is not the input the run evaluated.
         ValueError: Two cases map to one item, or a case's trials hold different input
             digests.
@@ -544,11 +557,13 @@ def verify_pushed(
     input_digests = _case_input_digests(by_case)
     groups = _group_cases(client=client, case_ids=list(by_case), item_of=item_of)
     _check_inputs(groups=groups, input_digests=input_digests)
+    project_id = _sole_project_id(client)
     _, missing = _await_visible(
         client=client,
         run=run,
         run_name=run_name,
         groups=groups,
+        project_id=project_id,
         input_digests=input_digests,
         timeout_s=timeout_s,
     )
@@ -565,6 +580,7 @@ def _await_visible(
     run: Run,
     run_name: str,
     groups: Sequence[_DatasetCases],
+    project_id: str,
     input_digests: Mapping[str, str],
     timeout_s: float,
     cases_only: bool = False,
@@ -591,7 +607,12 @@ def _await_visible(
     deadline = time.monotonic() + timeout_s
     while True:
         held = _read_pushed(
-            client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+            client=client,
+            run=run,
+            run_name=run_name,
+            groups=groups,
+            project_id=project_id,
+            input_digests=input_digests,
         )
         _check_matches(
             held=held, digests=expected_digests, scores=expected_scores, run_name=run_name
@@ -714,6 +735,7 @@ def _read_pushed(
     run: Run,
     run_name: str,
     groups: Sequence[_DatasetCases],
+    project_id: str,
     input_digests: Mapping[str, str],
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in each dataset, by case id.
@@ -725,7 +747,15 @@ def _read_pushed(
     """
     found: dict[str, _ItemRun] = {}
     for group in groups:
-        shown = _read_experiment_items(client=client, run=run, run_name=run_name, group=group)
+        shown = _read_experiment_items(
+            client=client,
+            run=run,
+            run_name=run_name,
+            experiment_id=_experiment_id(
+                project_id=project_id, dataset_id=group.dataset_id, run_name=run_name
+            ),
+            group=group,
+        )
         if stray := sorted(set(shown) - set(group.items)):
             raise PushMismatchError(
                 f"Langfuse shows cases {stray} under {run_name} in dataset "
@@ -737,7 +767,7 @@ def _read_pushed(
                     f"case {case_id!r} under {run_name} in dataset {group.dataset!r} is an "
                     f"item run of {item_run.item_id!r}, not of {mapped!r}"
                 )
-            if not _input_matches(item_run.input, input_digests[case_id]):
+            if not _read_back_input_matches(item_run.input, input_digests[case_id]):
                 raise PushMismatchError(
                     f"case {case_id!r} under {run_name} in dataset {group.dataset!r} ran on "
                     "another input than the run evaluated"
@@ -747,9 +777,12 @@ def _read_pushed(
 
 
 def _read_experiment_items(
-    *, client: Langfuse, run: Run, run_name: str, group: _DatasetCases
+    *, client: Langfuse, run: Run, run_name: str, experiment_id: str, group: _DatasetCases
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in one dataset, newest first.
+
+    The read filters on the experiment id a push writes under as well as its name, so
+    item runs another experiment of the same name holds stay out of the read-back.
 
     Raises:
         PushMismatchError: An item run lacks the metadata a push writes.
@@ -760,6 +793,7 @@ def _read_experiment_items(
         page = client.api.experiments.list_items(
             # No item run of this run's push can start before the run did.
             from_start_time=run.manifest.started_at,
+            experiment_id=experiment_id,
             experiment_name=run_name,
             dataset_id=group.dataset_id,
             fields=_READ_FIELDS,
@@ -782,7 +816,7 @@ def _read_experiment_items(
                     observation_id=item.id,
                     start_time=item.start_time,
                     item_id=item.experiment_item_id,
-                    input=_parsed(item.input),
+                    input=item.input,
                     case_digest=str(metadata[_CASE_DIGEST_KEY]),
                     output=_parsed(item.output),
                     output_digest=str(metadata[_OUTPUT_DIGEST_KEY]),
@@ -951,6 +985,18 @@ def _cases_on_other_input(*, group: _DatasetCases, input_digests: Mapping[str, s
 def _input_matches(value: object, digest: str) -> bool:
     """Whether a value read from Langfuse is the input a stored input digest names."""
     return input_digest(value) == digest
+
+
+def _read_back_input_matches(value: object, digest: str) -> bool:
+    """Whether an item run's input, as read back, is the input a digest names.
+
+    Langfuse may return an item run's input as JSON text, or a string input as the
+    string itself, so a string matches either as it is or parsed as JSON. Parsing alone
+    would read the string input ``"2024"`` as the number 2024.
+    """
+    if _input_matches(value, digest):
+        return True
+    return isinstance(value, str) and _input_matches(_parsed(value), digest)
 
 
 def _write_scores(

@@ -213,7 +213,10 @@ def test_a_run_is_scored_by_the_headline_check_its_manifest_names() -> None:
 
 
 def test_cases_with_different_trial_counts_raise() -> None:
-    run = make_run(make_case(case_id="a", trial=1), make_case(case_id="a", trial=2), make_case())
+    """Run refuses uneven cases, so build one past validation to test the guard."""
+    valid = make_run(make_case())
+    results = (make_case(case_id="a", trial=1), make_case(case_id="a", trial=2), make_case())
+    run = Run.model_construct(manifest=valid.manifest, results=results)
 
     with pytest.raises(ValueError, match=r"run 'run-1'.*without 2 trials: \['case-1'\]"):
         summarise_run(run=run)

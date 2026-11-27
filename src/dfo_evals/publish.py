@@ -6,9 +6,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from google.api_core.exceptions import GoogleAPIError
-from google.auth.exceptions import GoogleAuthError
-from google.cloud import storage
+try:
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
+    from google.cloud import storage
+except ModuleNotFoundError as error:
+    raise ModuleNotFoundError(
+        f"dfo_evals.publish needs the storage extra (dfo-evals[storage]): {error}"
+    ) from error
 from pydantic import TypeAdapter, ValidationError
 
 from dfo_evals.page import build_page
@@ -32,8 +37,12 @@ def _run_path(name: str) -> tuple[str, str] | None:
         return None
 
 
-def publish(*, bucket: storage.Bucket, root: Path) -> None:
-    """Download committed runs to an empty working directory and overwrite the HTML page."""
+def publish(*, bucket: storage.Bucket, root: Path) -> tuple[str, ...]:
+    """Download committed runs to an empty working directory and overwrite the HTML page.
+
+    Returns:
+        The runs the page left out as unreadable, as ``<suite>/<run_id>``.
+    """
     for manifest in bucket.list_blobs():
         if (run_path := _run_path(manifest.name)) is None:
             continue
@@ -43,10 +52,11 @@ def publish(*, bucket: storage.Bucket, root: Path) -> None:
         manifest.download_to_filename(run_dir / MANIFEST_FILE)
         bucket.blob(f"{suite}/{run_id}/{RESULTS_FILE}").download_to_filename(run_dir / RESULTS_FILE)
 
-    html = build_page(root=root)
+    built = build_page(root=root)
     page = bucket.blob(_PAGE_OBJECT)
     page.cache_control = "private, no-store"
-    page.upload_from_string(html, content_type="text/html; charset=utf-8")
+    page.upload_from_string(built.html, content_type="text/html; charset=utf-8")
+    return built.unreadable
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -59,13 +69,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         bucket = storage.Client().bucket(args.bucket)
         with TemporaryDirectory(prefix="dfo-evals-") as work:
-            publish(bucket=bucket, root=Path(work))
+            unreadable = publish(bucket=bucket, root=Path(work))
     except (GoogleAPIError, GoogleAuthError, OSError, ValueError) as error:
         # Validation and transport errors can include record contents.
         logger.error("Could not publish %s (%s)", _PAGE_OBJECT, type(error).__name__)
         return 1
 
     logger.info("Published gs://%s/%s", args.bucket, _PAGE_OBJECT)
+    if unreadable:
+        # Run names are safe directory names, so the public log may show them.
+        logger.error("The page left out unreadable runs: %s", ", ".join(unreadable))
+        return 1
     return 0
 
 

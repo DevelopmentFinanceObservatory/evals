@@ -375,8 +375,8 @@ dev = [
 requires-dist = [
     { name = "google-cloud-storage", marker = "extra == 'storage'", specifier = ">=3.13,<4" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=5.2,<6" },
-    { name = "opentelemetry-sdk", marker = "extra == 'langfuse'", specifier = ">=1.42" },
-    { name = "pydantic", specifier = ">=2.10" },
+    { name = "opentelemetry-sdk", marker = "extra == 'langfuse'", specifier = ">=1.45" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "pydantic-evals", specifier = ">=2.66" },
 ]
 provides-extras = ["langfuse", "storage"]
