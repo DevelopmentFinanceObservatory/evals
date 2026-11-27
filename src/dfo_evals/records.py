@@ -10,11 +10,14 @@ uploader that copies run files one at a time writes ``results.jsonl`` first and
 A suite cannot be named ``site``: the results bucket keeps the page at
 ``site/index.html``, beside the suite directories.
 
-Readers refuse a field they do not know, so a record format that gains a field, even an
-optional one, takes a new ``SCHEMA_VERSION``, and the release that adds it keeps reading
-every earlier version, since the bucket keeps every run. A reader refuses only a version
-newer than it knows, with ``RecordSchemaError``, and the results page lists that run as
-unreadable until the publisher's dfo-evals catches up.
+Writers record ``SCHEMA_VERSION`` in every manifest. Readers refuse a field they do not
+know, so a record format that gains a field, even an optional one, takes a new
+``SCHEMA_VERSION``, and the models of the release that adds it must still validate every
+earlier version, since the bucket keeps every run. ``read_run`` accepts a manifest whose
+``schema_version`` is an integer from 1 to ``SCHEMA_VERSION`` and validates it against
+the current models. It refuses a newer version, or a value that is not an integer of 1
+or more, with ``RecordSchemaError``, and the results page lists that run as unreadable
+until the publisher's dfo-evals catches up.
 """
 
 import json
@@ -25,7 +28,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Final, Literal, Self
+from typing import Annotated, Final, Self
 
 from pydantic import (
     AwareDatetime,
@@ -44,6 +47,11 @@ RESULTS_FILE: Final = "results.jsonl"
 RESERVED_SUITE: Final = "site"
 # Name of the single FAIL check recorded for a trial whose task raised.
 TASK_CHECK_NAME: Final = "task"
+# A revision holding this cannot name a Langfuse experiment, which reads it as a list
+# separator, so write_run refuses it.
+REVISION_SEPARATOR: Final = ","
+# The first schema version; readers accept every version from this to SCHEMA_VERSION.
+FIRST_SCHEMA_VERSION: Final = 1
 
 # Run and suite names become directory names, so they must not escape or hide.
 _SAFE_NAME_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -157,7 +165,7 @@ class RunManifest(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: int = Field(default=SCHEMA_VERSION, ge=FIRST_SCHEMA_VERSION, strict=True)
     suite: SafeName
     run_id: SafeName
     started_at: AwareDatetime
@@ -166,6 +174,17 @@ class RunManifest(BaseModel):
     environment: dict[str, str]
     dataset_digest: str
     headline_check: NonEmptyStr | None = None
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_version_not_newer(cls, version: int) -> int:
+        """Reject a schema version newer than this library reads."""
+        if version > SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version {version} is newer than this dfo-evals reads "
+                f"(up to {SCHEMA_VERSION})"
+            )
+        return version
 
     @field_validator("headline_check")
     @classmethod
@@ -176,14 +195,6 @@ class RunManifest(BaseModel):
                 f"headline_check {TASK_CHECK_NAME!r} is reserved for a task that raised"
             )
         return headline_check
-
-    @field_validator("revision")
-    @classmethod
-    def _revision_has_no_comma(cls, revision: str) -> str:
-        """Reject a comma, which Langfuse reads as a list separator in experiment names."""
-        if "," in revision:
-            raise ValueError(f"revision {revision!r} holds a comma")
-        return revision
 
     @field_validator("suite")
     @classmethod
@@ -237,6 +248,25 @@ class Run(BaseModel):
                 raise ValueError(
                     f"case {result.case_id!r} trial {result.trial} has tags {sorted(tags)}, "
                     f"another trial has {sorted(first)}; tags must be the same on every trial"
+                )
+        return results
+
+    @field_validator("results")
+    @classmethod
+    def _input_digest_per_case(cls, results: tuple[CaseResult, ...]) -> tuple[CaseResult, ...]:
+        """Reject a run whose trials of one case carry different input digests.
+
+        Every trial of a case runs on the case's one input, and a Langfuse push maps the
+        case to one dataset item holding that input.
+        """
+        digest_by_case: dict[str, str] = {}
+        for result in results:
+            first = digest_by_case.setdefault(result.case_id, result.input_digest)
+            if result.input_digest != first:
+                raise ValueError(
+                    f"case {result.case_id!r} trial {result.trial} has input digest "
+                    f"{result.input_digest!r}, another trial has {first!r}; every trial "
+                    "of a case must have the same input digest"
                 )
         return results
 
@@ -297,8 +327,12 @@ def write_run(*, root: Path, run: Run) -> Path:
         The run directory.
 
     Raises:
+        ValueError: The revision holds a comma, which Langfuse reads as a list separator
+            in experiment names. Nothing is written.
         FileExistsError: The run directory already exists.
     """
+    if REVISION_SEPARATOR in run.manifest.revision:
+        raise ValueError(f"revision {run.manifest.revision!r} holds a comma")
     suite_dir = root / run.manifest.suite
     run_dir = suite_dir / run.manifest.run_id
     if run_dir.exists():
@@ -391,10 +425,15 @@ def _read_manifest(path: Path) -> RunManifest:
     except json.JSONDecodeError as error:
         raise RecordSchemaError(f"{path}: not valid JSON: {error}") from error
     version = raw.get("schema_version") if isinstance(raw, dict) else None
-    if version != SCHEMA_VERSION:
+    # bool is an int subclass, but true is no version.
+    if not isinstance(version, int) or isinstance(version, bool) or version < FIRST_SCHEMA_VERSION:
         raise RecordSchemaError(
-            f"{path}: schema_version {version!r} does not match "
-            f"supported schema_version {SCHEMA_VERSION}"
+            f"{path}: schema_version {version!r} is not an integer from {FIRST_SCHEMA_VERSION}"
+        )
+    if version > SCHEMA_VERSION:
+        raise RecordSchemaError(
+            f"{path}: schema_version {version} is newer than this dfo-evals reads "
+            f"(up to {SCHEMA_VERSION})"
         )
     try:
         return RunManifest.model_validate(raw)

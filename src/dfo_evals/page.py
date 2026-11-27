@@ -40,6 +40,10 @@ CORPUS_CHANGED: Final = "corpus changed"
 # A change cell whose previous run named another headline check, so its trials passed
 # by another rule.
 HEADLINE_CHANGED: Final = "headline changed"
+# A change cell whose group scored other (case_id, trial) pairs in the previous run, such
+# as a trial newly excluded by a fault or a case that joined or left a tag, so a change
+# in rate would not measure the system.
+SCORED_TRIALS_CHANGED: Final = "scored trials changed"
 UNREADABLE_HEADING: Final = "Unreadable runs"
 MINUS_SIGN: Final = "\N{MINUS SIGN}"
 RANGE_SEPARATOR: Final = "\N{EN DASH}"
@@ -110,8 +114,8 @@ def build_page(*, root: Path) -> Page:
     Args:
         root: Directory holding ``<suite>/<run_id>/`` run records.
 
-    A run that fails to read, such as one of another schema version or one missing its
-    results file, is left out and listed at the end of the page, so one bad run leaves
+    A run that fails to read, such as one of a newer schema version or one whose results
+    file is missing or cannot be opened, is left out and listed at the end of the page, so one bad run leaves
     every other run on the page. The log names it by suite and run directory only, since
     a validation error can quote record contents. Callers report a page that left runs
     out as a failure once it is written.
@@ -128,7 +132,7 @@ def build_page(*, root: Path) -> Page:
     for run_dir in iter_runs(root=root):
         try:
             run = read_run(run_dir)
-        except (RecordSchemaError, FileNotFoundError) as error:
+        except (RecordSchemaError, OSError) as error:
             name = f"{run_dir.parent.name}/{run_dir.name}"
             logger.warning("left out unreadable run %s (%s)", name, type(error).__name__)
             unreadable.append(name)
@@ -328,12 +332,16 @@ def _change_cell(
 ) -> str:
     """Render a change cell; colour backs up the sign, never replaces it.
 
-    A change against a run it cannot be compared with shows the reason, uncoloured.
+    A change against a run it cannot be compared with shows the reason, uncoloured, as
+    does a change for a group whose two summaries scored different ``(case_id, trial)``
+    pairs.
     """
     if previous is None:
         return _num(NO_PREVIOUS)
     if incomparable is not None:
         return _num(incomparable)
+    if current.scored_pairs != previous.scored_pairs:
+        return _num(SCORED_TRIALS_CHANGED)
     text = format_change(rate_change_pp(current=current, previous=previous))
     if text.startswith("+"):
         return f'<td class="num up">{escape(text)}</td>'
@@ -381,7 +389,8 @@ def _document(body: str) -> str:
             "</main>",
             "<footer><p>Success rate is passes over scored trials. Change is in percentage "
             "points against the previous run of the same suite, shown only when both runs scored the "
-            "same corpus by the same headline check. Tags can overlap, so group rows need not "
+            "same corpus by the same headline check and the group scored the same trials of the "
+            "same cases in both. Tags can overlap, so group rows need not "
             "add up to All cases.</p></footer>",
             "</body>",
             "</html>",

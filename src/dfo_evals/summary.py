@@ -64,6 +64,7 @@ class GroupSummary:
         cases_with_excluded_trial: Cases with at least one excluded trial.
         fully_scored_passes: Passing trials of fully scored cases.
         cases_passing_all: Fully scored cases whose trials all pass.
+        scored_pairs: The ``(case_id, trial)`` pair of every scored trial.
         pass_distribution: Count of fully scored cases by number of passing trials,
             index 0 to ``trials_per_case``; None for single-trial runs.
     """
@@ -76,6 +77,7 @@ class GroupSummary:
     cases_with_excluded_trial: int
     fully_scored_passes: int
     cases_passing_all: int
+    scored_pairs: frozenset[tuple[str, int]]
     pass_distribution: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -118,6 +120,11 @@ class GroupSummary:
             raise ValueError(
                 f"scored {self.scored_trials} plus excluded {self.excluded_trials} trials is "
                 f"not {self.cases} cases of {self.trials_per_case} trials"
+            )
+        if len(self.scored_pairs) != self.scored_trials:
+            raise ValueError(
+                f"{len(self.scored_pairs)} scored (case_id, trial) pairs, "
+                f"not {self.scored_trials} scored trials"
             )
         if self.passes > self.scored_trials:
             raise ValueError(f"passes {self.passes} exceed scored trials {self.scored_trials}")
@@ -259,12 +266,12 @@ def trial_outcome(*, result: CaseResult, headline_check: str | None) -> TrialOut
 
 
 def summarise_group(
-    *, outcomes: Sequence[tuple[str, TrialOutcome]], trials_per_case: int
+    *, outcomes: Sequence[tuple[str, int, TrialOutcome]], trials_per_case: int
 ) -> GroupSummary:
     """Score one group of trials.
 
     Args:
-        outcomes: One ``(case_id, outcome)`` pair per trial in the group.
+        outcomes: One ``(case_id, trial, outcome)`` triple per trial in the group.
         trials_per_case: Trials every case in the run has; above one, the summary
             carries the distribution of cases by passing trials.
 
@@ -275,7 +282,7 @@ def summarise_group(
         ValueError: A case does not have ``trials_per_case`` trials.
     """
     by_case: defaultdict[str, Counter[TrialOutcome]] = defaultdict(Counter)
-    for case_id, outcome in outcomes:
+    for case_id, _, outcome in outcomes:
         by_case[case_id][outcome] += 1
     uneven = sorted(case for case, counts in by_case.items() if counts.total() != trials_per_case)
     if uneven:
@@ -287,7 +294,7 @@ def summarise_group(
         passes_per_case = Counter(counts[TrialOutcome.PASS] for counts in fully_scored)
         distribution = tuple(passes_per_case[count] for count in range(trials_per_case + 1))
 
-    totals = Counter(outcome for _, outcome in outcomes)
+    totals = Counter(outcome for _, _, outcome in outcomes)
     return GroupSummary(
         trials_per_case=trials_per_case,
         cases=len(by_case),
@@ -297,6 +304,11 @@ def summarise_group(
         cases_with_excluded_trial=len(by_case) - len(fully_scored),
         fully_scored_passes=sum(counts[TrialOutcome.PASS] for counts in fully_scored),
         cases_passing_all=sum(1 for counts in fully_scored if not counts[TrialOutcome.FAIL]),
+        scored_pairs=frozenset(
+            (case_id, trial)
+            for case_id, trial, outcome in outcomes
+            if outcome is not TrialOutcome.EXCLUDED
+        ),
         pass_distribution=distribution,
     )
 
@@ -319,14 +331,15 @@ def summarise_run(*, run: Run) -> RunSummary:
         Counter(result.case_id for result in run.results).values(), default=_SINGLE_TRIAL
     )
 
-    all_outcomes: list[tuple[str, TrialOutcome]] = []
-    tag_outcomes: defaultdict[str, list[tuple[str, TrialOutcome]]] = defaultdict(list)
+    all_outcomes: list[tuple[str, int, TrialOutcome]] = []
+    tag_outcomes: defaultdict[str, list[tuple[str, int, TrialOutcome]]] = defaultdict(list)
     for result in run.results:
         # Run rejects a trial lacking its headline check, so this cannot raise.
-        pair = (result.case_id, trial_outcome(result=result, headline_check=headline_check))
-        all_outcomes.append(pair)
+        outcome = trial_outcome(result=result, headline_check=headline_check)
+        triple = (result.case_id, result.trial, outcome)
+        all_outcomes.append(triple)
         for tag in dict.fromkeys(result.tags):
-            tag_outcomes[tag].append(pair)
+            tag_outcomes[tag].append(triple)
 
     # Every tag group's cases are a subset of all cases, so checking here covers them.
     try:

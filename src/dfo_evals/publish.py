@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 try:
-    from google.api_core.exceptions import GoogleAPIError
+    from google.api_core.exceptions import GoogleAPIError, NotFound
     from google.auth.exceptions import GoogleAuthError
     from google.cloud import storage
 except ModuleNotFoundError as error:
@@ -37,11 +37,28 @@ def _run_path(name: str) -> tuple[str, str] | None:
         return None
 
 
+def _download_results(*, bucket: storage.Bucket, suite: str, run_id: str, run_dir: Path) -> None:
+    """Download a run's results file, leaving none behind when the object is missing."""
+    target = run_dir / RESULTS_FILE
+    try:
+        bucket.blob(f"{suite}/{run_id}/{RESULTS_FILE}").download_to_filename(target)
+    except NotFound:
+        # suite and run_id are validated safe names, so the log may show them.
+        logger.warning("Run %s/%s has no %s object", suite, run_id, RESULTS_FILE)
+        target.unlink(missing_ok=True)
+
+
 def publish(*, bucket: storage.Bucket, root: Path) -> tuple[str, ...]:
     """Download committed runs to an empty working directory and overwrite the HTML page.
 
+    A run whose results object is missing keeps only its manifest, so the page lists it
+    as unreadable.
+
     Returns:
         The runs the page left out as unreadable, as ``<suite>/<run_id>``.
+
+    Raises:
+        ValueError: No run is readable; the page is left untouched.
     """
     for manifest in bucket.list_blobs():
         if (run_path := _run_path(manifest.name)) is None:
@@ -50,7 +67,7 @@ def publish(*, bucket: storage.Bucket, root: Path) -> tuple[str, ...]:
         run_dir = root / suite / run_id
         run_dir.mkdir(parents=True)
         manifest.download_to_filename(run_dir / MANIFEST_FILE)
-        bucket.blob(f"{suite}/{run_id}/{RESULTS_FILE}").download_to_filename(run_dir / RESULTS_FILE)
+        _download_results(bucket=bucket, suite=suite, run_id=run_id, run_dir=run_dir)
 
     built = build_page(root=root)
     page = bucket.blob(_PAGE_OBJECT)

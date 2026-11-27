@@ -79,7 +79,14 @@ def group(**overrides) -> GroupSummary:
         "fully_scored_passes": 1,
         "cases_passing_all": 1,
     } | overrides
-    return GroupSummary(**fields)
+    return GroupSummary(**(fields | {"scored_pairs": scored_pairs(fields["scored_trials"])}))
+
+
+def scored_pairs(count: int, *, trials_per_case: int = 1) -> frozenset[tuple[str, int]]:
+    """Distinct ``(case_id, trial)`` pairs, ``count`` of them."""
+    return frozenset(
+        (f"case-{index // trials_per_case}", index % trials_per_case + 1) for index in range(count)
+    )
 
 
 def multi_group(**overrides) -> GroupSummary:
@@ -95,7 +102,8 @@ def multi_group(**overrides) -> GroupSummary:
         "cases_passing_all": 1,
         "pass_distribution": (0, 1, 1),
     } | overrides
-    return GroupSummary(**fields)
+    pairs = scored_pairs(fields["scored_trials"], trials_per_case=fields["trials_per_case"])
+    return GroupSummary(**(fields | {"scored_pairs": pairs}))
 
 
 @pytest.mark.parametrize("fault", [FaultClass.GRADER, FaultClass.INFRA, FaultClass.REFERENCE])
@@ -192,6 +200,7 @@ def test_a_run_is_scored_overall_and_per_tag() -> None:
         cases_with_excluded_trial=1,
         fully_scored_passes=2,
         cases_passing_all=2,
+        scored_pairs=frozenset({("a", 1), ("b", 1), ("c", 1)}),
     )
     assert summary.all_cases.success_rate == pytest.approx(2 / 3)
     assert list(summary.by_tag) == ["corpus/dac.yaml", "corpus/imf.yaml"]
@@ -388,3 +397,33 @@ def test_a_distribution_holding_the_wrong_number_of_passes_raises() -> None:
 def test_a_top_bucket_not_matching_cases_passing_all_raises() -> None:
     with pytest.raises(ValueError, match="top bucket 1 is not cases passing all 0"):
         multi_group(cases_passing_all=0)
+
+
+def test_a_group_carries_the_case_and_trial_of_every_scored_trial() -> None:
+    run = make_run(
+        make_case(case_id="a", trial=1, tags=("dac",)),
+        make_case(case_id="a", trial=2, verdicts={}, fault=FaultClass.INFRA, tags=("dac",)),
+        make_case(case_id="b", trial=1, verdicts={HEADLINE: Verdict.FAIL}, tags=("imf",)),
+        make_case(case_id="b", trial=2, tags=("imf",)),
+    )
+
+    summary = summarise_run(run=run)
+
+    assert summary.all_cases.scored_pairs == {("a", 1), ("b", 1), ("b", 2)}
+    assert summary.by_tag["dac"].scored_pairs == {("a", 1)}
+    assert summary.by_tag["imf"].scored_pairs == {("b", 1), ("b", 2)}
+
+
+def test_scored_pairs_not_matching_scored_trials_raise() -> None:
+    with pytest.raises(ValueError, match=r"1 scored .* pairs, not 2 scored trials"):
+        GroupSummary(
+            trials_per_case=1,
+            cases=2,
+            scored_trials=2,
+            passes=1,
+            excluded_trials=0,
+            cases_with_excluded_trial=0,
+            fully_scored_passes=1,
+            cases_passing_all=1,
+            scored_pairs=frozenset({("a", 1)}),
+        )

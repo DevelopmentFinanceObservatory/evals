@@ -1,12 +1,16 @@
 import datetime
 import hashlib
 import json
+import re
 import uuid
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 
 from dfo_evals.langfuse_sink import (
     DatasetItemRef,
@@ -80,6 +84,8 @@ class _FakeLangfuse:
         self.now = _STARTED + datetime.timedelta(hours=1)
         self.shut_down = False
         self.experiment_ids: list[str | None] = []
+        # Whether each run_experiment call ran under a caller's span.
+        self.parent_spans: list[bool] = []
         self.api = SimpleNamespace(
             projects=SimpleNamespace(
                 get=lambda: SimpleNamespace(data=[SimpleNamespace(id=project)])
@@ -146,6 +152,7 @@ class _FakeLangfuse:
         **_: Any,
     ) -> Any:
         self.experiments.append((run_name, {item.dataset_name for item in data}))
+        self.parent_spans.append(otel_trace.get_current_span().get_span_context().is_valid)
         self.experiment_ids.append(experiment_id)
         given_id = experiment_id
         results = []
@@ -720,10 +727,14 @@ def test_an_item_run_of_another_item_fails_verification() -> None:
 
 
 def test_trials_of_one_case_with_different_input_digests_are_refused() -> None:
+    """Run refuses such trials, so build one past validation to test the sink's guard."""
     fake = _with_items("a")
-    run = _run(
-        _result("a", 1, answer=Verdict.PASS),
-        _result("a", 2, answer=Verdict.PASS).model_copy(update={"input_digest": "sha256:x"}),
+    run = Run.model_construct(
+        manifest=_run().manifest,
+        results=(
+            _result("a", 1, answer=Verdict.PASS),
+            _result("a", 2, answer=Verdict.PASS).model_copy(update={"input_digest": "sha256:x"}),
+        ),
     )
 
     with pytest.raises(ValueError, match="different input digests"):
@@ -857,7 +868,11 @@ def test_a_case_that_never_appears_raises_and_pushing_again_sends_only_it() -> N
     fake = _with_items("a", "b")
     fake.drop_runs = 1
 
-    with pytest.raises(PushIncompleteError, match=r"shows 1 of the 2 cases.*push the run again"):
+    with pytest.raises(
+        PushIncompleteError,
+        match=r"shows 1 of the 2 cases.*has not shown \['a'\] yet.*verify_pushed later.*"
+        r"pushing the run again sends them again",
+    ):
         _push(fake, _TWO_CASES)
     name = _push(fake, _TWO_CASES)
 
@@ -1053,3 +1068,86 @@ def test_a_push_and_a_verify_each_look_up_the_project_once_however_long_they_wai
     _verify(fake, _TWO_CASES, name, timeout_s=60)
 
     assert len(lookups) == 2
+
+
+_UNSAFE_INTEGER = 9007199254740993
+
+
+@pytest.mark.parametrize(
+    ("field", "spec", "path"),
+    [
+        ("input", DatasetItemSpec(item_id="x:2", input={"id": _UNSAFE_INTEGER}), "['id']"),
+        (
+            "expected_output",
+            DatasetItemSpec(item_id="x:2", input={"q": 1}, expected_output=[1, -_UNSAFE_INTEGER]),
+            "[1]",
+        ),
+        (
+            "metadata",
+            DatasetItemSpec(item_id="x:2", input={"q": 1}, metadata={"a": {"b": _UNSAFE_INTEGER}}),
+            "['a']['b']",
+        ),
+    ],
+)
+def test_an_item_holding_an_unsafe_integer_is_refused_before_anything_is_written(
+    field: str, spec: DatasetItemSpec, path: str
+) -> None:
+    fake = _FakeLangfuse()
+
+    with pytest.raises(ValueError, match=re.escape(f"item 'x:2' {field} holds integers")) as caught:
+        upsert_items(
+            client=fake, dataset="x", items=[DatasetItemSpec(item_id="x:1", input={"q": 1}), spec]
+        )
+
+    assert path in str(caught.value)
+    assert (fake.datasets, fake.item_writes) == ({}, [])
+
+
+def test_an_item_holding_the_largest_safe_integer_is_written() -> None:
+    fake = _FakeLangfuse()
+    spec = DatasetItemSpec(item_id="x:1", input={"id": 2**53 - 1, "flag": True})
+
+    assert upsert_items(client=fake, dataset="x", items=[spec]) == ["x:1"]
+
+
+def test_an_output_holding_an_unsafe_integer_is_refused_before_anything_is_written() -> None:
+    fake = _with_items("a", "b")
+
+    with pytest.raises(ValueError, match=r"case 'b' output holds integers") as caught:
+        _push(fake, _TWO_CASES, outputs={("b", 1): {"rows": [{"id": _UNSAFE_INTEGER}]}})
+
+    assert "['outputs'][0]['rows'][0]['id']" in str(caught.value)
+    assert (fake.runs, fake.score_writes) == ([], [])
+
+
+def test_a_trial_number_beyond_the_safe_range_is_refused_before_anything_is_written() -> None:
+    fake = _with_items("a")
+    run = _run(_result("a", _UNSAFE_INTEGER, answer=Verdict.PASS))
+
+    with pytest.raises(ValueError, match=r"case 'a' output holds integers"):
+        _push(fake, run)
+
+    assert (fake.runs, fake.score_writes) == ([], [])
+
+
+def test_a_revision_holding_a_comma_is_refused_before_anything_is_written() -> None:
+    fake = _with_items("a", "b")
+    run = _TWO_CASES.model_copy(
+        update={"manifest": _TWO_CASES.manifest.model_copy(update={"revision": "abc,dirty"})}
+    )
+
+    with pytest.raises(ValueError, match="holds a comma"):
+        _push(fake, run)
+
+    assert (fake.runs, fake.score_writes) == ([], [])
+
+
+def test_a_push_under_an_unsampled_span_sends_its_item_runs_in_a_fresh_trace() -> None:
+    """Under an unsampled parent, langfuse records no item spans yet returns every result."""
+    fake = _with_items("a", "b")
+    tracer = TracerProvider(sampler=ALWAYS_OFF).get_tracer("caller")
+
+    with tracer.start_as_current_span("caller"):
+        _push(fake, _TWO_CASES)
+
+    assert fake.parent_spans == [False]
