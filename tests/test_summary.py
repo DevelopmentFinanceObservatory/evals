@@ -500,3 +500,13 @@ def group_with_outcomes(outcomes: frozenset[tuple[str, int, bool]]) -> GroupSumm
         cases_passing_all=1,
         scored_outcomes=outcomes,
     )
+
+
+def test_a_partial_change_is_rounded_once() -> None:
+    """Over three shared trials, 1 of 3 to 2 of 3 is +33.3 pp, not 66.7 - 33.3."""
+    before = single_trial_group({"a": True, "b": False, "c": False, "d": True})
+    after = single_trial_group({"a": True, "b": True, "c": False})
+
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=33.3, trials=3, partial=True
+    )

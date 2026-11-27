@@ -386,9 +386,10 @@ class SharedChange:
 def shared_change(*, current: GroupSummary, previous: GroupSummary) -> SharedChange:
     """Change in success rate between two runs over the trials both scored.
 
-    Each run's rate over the shared ``(case_id, trial)`` pairs is rounded as the page
-    shows a rate before taking the difference. When both runs scored the same pairs,
-    those rates are the groups' success rates, so the change agrees with them.
+    When both runs scored the same pairs, each run's rate is its group's success rate,
+    rounded as the page shows it before taking the difference, so the change agrees with
+    the rates on the page. Otherwise neither shared rate is shown, so the difference of
+    the unrounded rates is rounded once.
 
     Args:
         current: The group in the later run.
@@ -402,14 +403,18 @@ def shared_change(*, current: GroupSummary, previous: GroupSummary) -> SharedCha
     before = _passed_by_pair(previous)
     shared = now.keys() & before.keys()
     partial = len(shared) < len(now) or len(shared) < len(before)
-    now_rate = display_percent(_share(sum(now[pair] for pair in shared), len(shared)))
-    before_rate = display_percent(_share(sum(before[pair] for pair in shared), len(shared)))
-    if now_rate is None or before_rate is None:
+    now_share = _share(sum(now[pair] for pair in shared), len(shared))
+    before_share = _share(sum(before[pair] for pair in shared), len(shared))
+    if now_share is None or before_share is None:
         return SharedChange(change_pp=None, trials=0, partial=partial)
+    if partial:
+        change = (now_share - before_share) * PERCENT
+    else:
+        change = round(now_share * PERCENT, PERCENT_DECIMALS) - round(
+            before_share * PERCENT, PERCENT_DECIMALS
+        )
     return SharedChange(
-        change_pp=round(now_rate - before_rate, PERCENT_DECIMALS),
-        trials=len(shared),
-        partial=partial,
+        change_pp=round(change, PERCENT_DECIMALS), trials=len(shared), partial=partial
     )
 
 
