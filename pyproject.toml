@@ -16,6 +16,7 @@ langfuse = [
     "langfuse>=5.2,<6",
     "opentelemetry-sdk>=1.42",
 ]
+storage = ["google-cloud-storage>=3.13,<4"]
 
 [project.scripts]
 dfo-evals-page = "dfo_evals.page:main"
@@ -27,6 +28,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "dfo-evals[langfuse]",
+    "dfo-evals[storage]",
     "ruff>=0.15.0",
     "ty>=0.0.59",
     "pytest>=9.1.0",

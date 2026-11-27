@@ -1,0 +1,44 @@
+name: Publish eval results
+
+on:
+  schedule:
+    # After the API nightly scheduled at 04:17 UTC.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-eval-results
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install publisher dependencies
+        run: uv sync --locked --no-dev --extra storage
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/41292283861/locations/global/workloadIdentityPools/github-pool/providers/github
+          service_account: dfo-dev-evals-runner@dev-fin-observatory.iam.gserviceaccount.com
+
+      - name: Publish the results page
+        run: uv run --no-sync python -m dfo_evals.publish --bucket dfo-dev-eval-runs-dev-fin-observatory

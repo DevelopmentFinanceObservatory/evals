@@ -1,0 +1,73 @@
+"""Publish the results page from the complete run records in Cloud Storage."""
+
+import argparse
+import logging
+from collections.abc import Sequence
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from google.api_core.exceptions import GoogleAPIError
+from google.auth.exceptions import GoogleAuthError
+from google.cloud import storage
+from pydantic import TypeAdapter, ValidationError
+
+from dfo_evals.page import build_page
+from dfo_evals.records import MANIFEST_FILE, RESERVED_SUITE, RESULTS_FILE, SafeName
+
+logger = logging.getLogger(__name__)
+_PAGE_OBJECT = "site/index.html"
+_SAFE_NAME = TypeAdapter(SafeName)
+
+
+def _run_path(name: str) -> tuple[str, str] | None:
+    parts = name.split("/")
+    if len(parts) != 3 or parts[-1] != MANIFEST_FILE:
+        return None
+    suite, run_id, _ = parts
+    if suite == RESERVED_SUITE:
+        return None
+    try:
+        return _SAFE_NAME.validate_python(suite), _SAFE_NAME.validate_python(run_id)
+    except ValidationError:
+        return None
+
+
+def publish(*, bucket: storage.Bucket, root: Path) -> None:
+    """Download committed runs to an empty working directory and overwrite the HTML page."""
+    for manifest in bucket.list_blobs():
+        if (run_path := _run_path(manifest.name)) is None:
+            continue
+        suite, run_id = run_path
+        run_dir = root / suite / run_id
+        run_dir.mkdir(parents=True)
+        manifest.download_to_filename(run_dir / MANIFEST_FILE)
+        bucket.blob(f"{suite}/{run_id}/{RESULTS_FILE}").download_to_filename(run_dir / RESULTS_FILE)
+
+    html = build_page(root=root)
+    page = bucket.blob(_PAGE_OBJECT)
+    page.cache_control = "private, no-store"
+    page.upload_from_string(html, content_type="text/html; charset=utf-8")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Publish to the named bucket using Application Default Credentials."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bucket", required=True, help="Cloud Storage bucket name")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO)
+
+    try:
+        bucket = storage.Client().bucket(args.bucket)
+        with TemporaryDirectory(prefix="dfo-evals-") as work:
+            publish(bucket=bucket, root=Path(work))
+    except (GoogleAPIError, GoogleAuthError, OSError, ValueError) as error:
+        # Validation and transport errors can include record contents.
+        logger.error("Could not publish %s (%s)", _PAGE_OBJECT, type(error).__name__)
+        return 1
+
+    logger.info("Published gs://%s/%s", args.bucket, _PAGE_OBJECT)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
