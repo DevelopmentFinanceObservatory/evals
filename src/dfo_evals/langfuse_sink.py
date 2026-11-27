@@ -32,6 +32,11 @@ Langfuse 5 derives from the project, dataset and run name, so pushing the same r
 lands in the same experiment and sends only the cases and scores Langfuse lacks. A different run never
 shares a name. Every digest here is taken after whole-number floats become integers, so
 a store that returns ``1.0`` as ``1`` still matches.
+
+The run name's format, the item run metadata keys and the namespaces the experiment and
+score ids derive from are fixed. Experiments already in Langfuse were written under
+them, and a change would make a later push of the same run create a second experiment
+and second scores.
 """
 
 import hashlib
@@ -724,8 +729,17 @@ def _read_pushed(
             or holds another input than the run evaluated.
     """
     found: dict[str, _ItemRun] = {}
+    project_id = _sole_project_id(client)
     for group in groups:
-        shown = _read_experiment_items(client=client, run=run, run_name=run_name, group=group)
+        shown = _read_experiment_items(
+            client=client,
+            run=run,
+            run_name=run_name,
+            experiment_id=_experiment_id(
+                project_id=project_id, dataset_id=group.dataset_id, run_name=run_name
+            ),
+            group=group,
+        )
         if stray := sorted(set(shown) - set(group.items)):
             raise PushMismatchError(
                 f"Langfuse shows cases {stray} under {run_name} in dataset "
@@ -737,7 +751,7 @@ def _read_pushed(
                     f"case {case_id!r} under {run_name} in dataset {group.dataset!r} is an "
                     f"item run of {item_run.item_id!r}, not of {mapped!r}"
                 )
-            if not _input_matches(item_run.input, input_digests[case_id]):
+            if not _read_back_input_matches(item_run.input, input_digests[case_id]):
                 raise PushMismatchError(
                     f"case {case_id!r} under {run_name} in dataset {group.dataset!r} ran on "
                     "another input than the run evaluated"
@@ -747,9 +761,12 @@ def _read_pushed(
 
 
 def _read_experiment_items(
-    *, client: Langfuse, run: Run, run_name: str, group: _DatasetCases
+    *, client: Langfuse, run: Run, run_name: str, experiment_id: str, group: _DatasetCases
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in one dataset, newest first.
+
+    The read filters on the experiment id a push writes under as well as its name, so
+    item runs another experiment of the same name holds stay out of the read-back.
 
     Raises:
         PushMismatchError: An item run lacks the metadata a push writes.
@@ -760,6 +777,7 @@ def _read_experiment_items(
         page = client.api.experiments.list_items(
             # No item run of this run's push can start before the run did.
             from_start_time=run.manifest.started_at,
+            experiment_id=experiment_id,
             experiment_name=run_name,
             dataset_id=group.dataset_id,
             fields=_READ_FIELDS,
@@ -782,7 +800,7 @@ def _read_experiment_items(
                     observation_id=item.id,
                     start_time=item.start_time,
                     item_id=item.experiment_item_id,
-                    input=_parsed(item.input),
+                    input=item.input,
                     case_digest=str(metadata[_CASE_DIGEST_KEY]),
                     output=_parsed(item.output),
                     output_digest=str(metadata[_OUTPUT_DIGEST_KEY]),
@@ -951,6 +969,18 @@ def _cases_on_other_input(*, group: _DatasetCases, input_digests: Mapping[str, s
 def _input_matches(value: object, digest: str) -> bool:
     """Whether a value read from Langfuse is the input a stored input digest names."""
     return input_digest(value) == digest
+
+
+def _read_back_input_matches(value: object, digest: str) -> bool:
+    """Whether an item run's input, as read back, is the input a digest names.
+
+    Langfuse may return an item run's input as JSON text, or a string input as the
+    string itself, so a string matches either as it is or parsed as JSON. Parsing alone
+    would read the string input ``"2024"`` as the number 2024.
+    """
+    if _input_matches(value, digest):
+        return True
+    return isinstance(value, str) and _input_matches(_parsed(value), digest)
 
 
 def _write_scores(
