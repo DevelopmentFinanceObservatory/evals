@@ -66,3 +66,15 @@ def test_main_publishes_and_fails_when_the_page_left_runs_out(
 
     assert publish.main(["--bucket", "bucket"]) == code
     assert ("apis-search/nightly-2" in caplog.text) == bool(unreadable)
+
+
+def test_publish_returns_the_runs_the_page_left_out(tmp_path, monkeypatch):
+    bucket = Mock()
+    bucket.list_blobs.return_value = []
+    left_out = ("apis-search/nightly-2",)
+    monkeypatch.setattr(
+        publish, "build_page", lambda *, root: Page(html="<html></html>", unreadable=left_out)
+    )
+
+    assert publish.publish(bucket=bucket, root=tmp_path) == left_out
+    bucket.blob.return_value.upload_from_string.assert_called_once()

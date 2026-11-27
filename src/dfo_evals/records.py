@@ -11,8 +11,10 @@ A suite cannot be named ``site``: the results bucket keeps the page at
 ``site/index.html``, beside the suite directories.
 
 Readers refuse a field they do not know, so a record format that gains a field, even an
-optional one, takes a new ``SCHEMA_VERSION``. A reader refuses a run of another version
-with ``RecordSchemaError``, and the results page lists that run as unreadable.
+optional one, takes a new ``SCHEMA_VERSION``, and the release that adds it keeps reading
+every earlier version, since the bucket keeps every run. A reader refuses only a version
+newer than it knows, with ``RecordSchemaError``, and the results page lists that run as
+unreadable until the publisher's dfo-evals catches up.
 """
 
 import json

@@ -1036,3 +1036,20 @@ def test_item_runs_of_another_experiment_under_the_same_name_are_left_out_of_the
 def test_a_string_input_matches_read_back_as_itself_or_as_json_text(read_back: str) -> None:
     """Langfuse may return a string input as the string or as JSON text."""
     assert _read_back_input_matches(read_back, input_digest("2024"))
+
+
+def test_a_push_and_a_verify_each_look_up_the_project_once_however_long_they_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dfo_evals.langfuse_sink.time.sleep", lambda _: None)
+    fake = _with_items("a", "b")
+    lookups: list[None] = []
+    get = fake.api.projects.get
+    fake.api.projects.get = lambda: lookups.append(None) or get()
+    fake.hidden_reads = 3
+
+    name = _push(fake, _TWO_CASES, timeout_s=60)
+    fake.hidden_reads = 2
+    _verify(fake, _TWO_CASES, name, timeout_s=60)
+
+    assert len(lookups) == 2
