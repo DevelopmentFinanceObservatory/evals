@@ -55,6 +55,7 @@ try:
     from langfuse import Evaluation, Langfuse
     from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
     from langfuse.experiment import ExperimentItem
+    from opentelemetry import context as otel_context
     from opentelemetry.sdk.trace import TracerProvider
 except ModuleNotFoundError as error:
     raise ModuleNotFoundError(
@@ -89,6 +90,9 @@ _NAME_SEPARATOR: Final = ","
 _READ_FIELDS: Final = "core,io,metadata,scores"
 # Scores list_items returns per item run at most; the API caps score_limit at 50.
 _MAX_SCORES: Final = 50
+# JavaScript's Number.MAX_SAFE_INTEGER. The SDK encodes an integer of larger magnitude as
+# a string, so it would read back changed and fail every digest comparison.
+_MAX_SAFE_INTEGER: Final = 2**53 - 1
 # Langfuse disables every client, whatever its settings, when this variable is "false".
 _TRACING_ENABLED_ENV: Final = "LANGFUSE_TRACING_ENABLED"
 _TRACING_DISABLED: Final = "false"
@@ -125,7 +129,7 @@ class PushMismatchError(LangfuseSinkError):
 
 
 class PushIncompleteError(LangfuseSinkError):
-    """Cases sent to Langfuse never appeared there within the timeout."""
+    """Langfuse has not shown some cases sent to it within the timeout."""
 
 
 class PushTimeoutError(LangfuseSinkError):
@@ -205,6 +209,12 @@ def connect(*, public_key: str, secret_key: str, base_url: str, project_id: str)
 
     The client sends on a tracer provider of its own, so spans from the system under
     test in the same process are not exported to Langfuse.
+
+    langfuse 5.2 keeps one client per public key in a process. When a client is
+    already open on ``public_key``, the SDK reuses it and ignores the ``TracerProvider``
+    given here, so spans then go wherever that client's provider sends them. The
+    ``shutdown()`` after ``WrongProjectError`` stops that shared client too, for every
+    holder of it.
 
     Args:
         public_key: Langfuse public key.
@@ -306,24 +316,32 @@ def upsert_items(*, client: Langfuse, dataset: str, items: Sequence[DatasetItemS
         The ids of the items written, in the order given.
 
     Raises:
-        ValueError: Two items share an id, or an item has no input, which
-            ``run_experiment`` would skip.
+        ValueError: Two items share an id, an item has no input, which
+            ``run_experiment`` would skip, or an item's input, expected output or
+            metadata holds an integer beyond JavaScript's safe range. Nothing is written.
     """
     ids = [item.item_id for item in items]
     if len(set(ids)) != len(ids):
         raise ValueError(f"dataset {dataset!r}: item ids repeat: {ids}")
     if no_input := [item.item_id for item in items if item.input is None]:
         raise ValueError(f"dataset {dataset!r}: items have no input: {no_input}")
+    wanted_by_id = {
+        spec.item_id: {
+            "input": to_jsonable_python(spec.input),
+            "expected_output": to_jsonable_python(spec.expected_output),
+            "metadata": to_jsonable_python(spec.metadata),
+        }
+        for spec in items
+    }
+    for item_id, fields in wanted_by_id.items():
+        for name, value in fields.items():
+            _refuse_unsafe_integers(value, where=f"dataset {dataset!r} item {item_id!r} {name}")
 
     held = _held_dataset(client=client, dataset=dataset, create=True)
     held_items = held.items if held else {}
     written = []
     for spec in items:
-        wanted = {
-            "input": to_jsonable_python(spec.input),
-            "expected_output": to_jsonable_python(spec.expected_output),
-            "metadata": to_jsonable_python(spec.metadata),
-        }
+        wanted = wanted_by_id[spec.item_id]
         item = held_items.get(spec.item_id)
         if (
             item is not None
@@ -385,13 +403,16 @@ def push_run(
             Nothing is written.
         ValueError: ``outputs`` names a case and trial the run lacks, a case's trials
             hold different input digests, two cases map to one item, the revision holds
-            a comma, a case scores more checks than Langfuse reads back, or a dataset
-            item has no input. Nothing is written.
+            a comma, a case scores more checks than Langfuse reads back, a dataset
+            item has no input, or a case's records or outputs hold an integer beyond
+            JavaScript's safe range. Nothing is written.
         PushMismatchError: Langfuse holds a case under this experiment that differs from
             the run's, in a dataset or item the case does not map to, or on another
             input.
-        PushIncompleteError: Cases sent never appeared within ``timeout_s``. Pushing
-            the run again sends them and writes their scores.
+        PushIncompleteError: Langfuse has not shown some cases sent within
+            ``timeout_s``. They may still appear: ``verify_pushed`` checks later. Pushing
+            the run again sends them again, so a case Langfuse was only slow to show
+            would get a second item run.
         PushTimeoutError: Every case appeared but some scores did not within
             ``timeout_s``. Pushing the run again writes those scores again under the
             same ids and timestamps, so a score that was only slow is overwritten, not
@@ -418,6 +439,9 @@ def push_run(
     case_outputs = {
         case_id: _case_output(case_id, results, outputs) for case_id, results in by_case.items()
     }
+    # Each case's output holds its records and the caller's outputs, as the push sends them.
+    for case_id, output in case_outputs.items():
+        _refuse_unsafe_integers(output, where=f"case {case_id!r} output")
 
     project_id = _sole_project_id(client)
     held = _read_pushed(
@@ -500,8 +524,9 @@ def push_run(
     if never := [case_id for case_id in pending if case_id not in shown]:
         raise PushIncompleteError(
             f"after {timeout_s:.0f} s Langfuse shows {len(pending) - len(never)} of the "
-            f"{len(pending)} cases sent under {run_name}; push the run again to send "
-            f"{never}"
+            f"{len(pending)} cases sent under {run_name}; it has not shown {never} yet. "
+            "Run verify_pushed later to check them; pushing the run again sends them "
+            "again, so a case Langfuse was only slow to show would get a second item run"
         )
 
     _, missing = _await_visible(
@@ -693,6 +718,12 @@ def _send(
     """Send one item run per item of one dataset through ``run_experiment``.
 
     It runs no evaluators: ``_write_scores`` writes every score once the item runs show.
+
+    ``run_experiment`` runs in an empty OpenTelemetry context. Its item spans would
+    otherwise become children of the caller's current span, and under an unsampled
+    parent langfuse records none of them while still returning every item result. The
+    empty context also drops the caller's baggage, and each item's trace is a root
+    trace, not a child of the caller's span. The caller's context is restored after.
     """
 
     def task(*, item: ExperimentItem, **_: object) -> object:
@@ -702,23 +733,27 @@ def _send(
         return outputs[_case_id_of(item.metadata)]
 
     manifest = run.manifest
-    result = client.run_experiment(
-        name=manifest.suite,
-        run_name=run_name,
-        experiment_id=experiment_id,
-        description=f"{manifest.suite} run {manifest.run_id} at {manifest.revision}",
-        data=data,
-        task=task,
-        evaluators=[],
-        max_concurrency=_PUSH_CONCURRENCY,
-        metadata={
-            "suite": manifest.suite,
-            "run_id": manifest.run_id,
-            "revision": manifest.revision,
-            "dataset_digest": manifest.dataset_digest,
-            "started_at": manifest.started_at.isoformat(),
-        },
-    )
+    token = otel_context.attach(otel_context.Context())
+    try:
+        result = client.run_experiment(
+            name=manifest.suite,
+            run_name=run_name,
+            experiment_id=experiment_id,
+            description=f"{manifest.suite} run {manifest.run_id} at {manifest.revision}",
+            data=data,
+            task=task,
+            evaluators=[],
+            max_concurrency=_PUSH_CONCURRENCY,
+            metadata={
+                "suite": manifest.suite,
+                "run_id": manifest.run_id,
+                "revision": manifest.revision,
+                "dataset_digest": manifest.dataset_digest,
+                "started_at": manifest.started_at.isoformat(),
+            },
+        )
+    finally:
+        otel_context.detach(token)
     if len(result.item_results) != len(data):
         # The read-back after sending decides which cases are truly missing.
         logger.warning(
@@ -954,6 +989,38 @@ def _case_input_digests(by_case: Mapping[str, Sequence[CaseResult]]) -> dict[str
             raise ValueError(f"case {case_id!r}: trials hold different input digests {found}")
         digests[case_id] = found.pop()
     return digests
+
+
+def _refuse_unsafe_integers(value: object, *, where: str) -> None:
+    """Refuse a JSON-compatible value holding an integer beyond JavaScript's safe range.
+
+    Raises:
+        ValueError: The value holds such an integer, named by ``where`` and its path.
+    """
+    if paths := _unsafe_integer_paths(value, path=""):
+        raise ValueError(
+            f"{where} holds integers of magnitude above {_MAX_SAFE_INTEGER}, which "
+            f"Langfuse would store as strings, at {', '.join(paths)}"
+        )
+
+
+def _unsafe_integer_paths(value: object, *, path: str) -> list[str]:
+    """The paths, as subscripts from the top, of the unsafe integers in a value."""
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [path or "the top level"] if abs(value) > _MAX_SAFE_INTEGER else []
+    if isinstance(value, dict):
+        children = [(f"{path}[{key!r}]", item) for key, item in value.items()]
+    elif isinstance(value, list | tuple):
+        children = [(f"{path}[{index}]", item) for index, item in enumerate(value)]
+    else:
+        return []
+    return [
+        found
+        for child_path, item in children
+        for found in _unsafe_integer_paths(item, path=child_path)
+    ]
 
 
 def _check_inputs(*, groups: Sequence[_DatasetCases], input_digests: Mapping[str, str]) -> None:

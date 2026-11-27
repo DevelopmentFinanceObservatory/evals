@@ -116,7 +116,7 @@ jobs:
         run: uv sync --frozen --python ${{ matrix.python-version }}
 
       - name: Test
-        run: uv run pytest
+        run: uv run --no-sync pytest
 
   # Consumers pin their own pydantic-ai-slim (ai is on 2.66), and each pydantic-evals
   # release pins pydantic-ai-slim exactly, so the declared lower bounds must work.

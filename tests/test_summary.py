@@ -16,9 +16,10 @@ from dfo_evals.records import (
 from dfo_evals.summary import (
     GroupSummary,
     MissingHeadlineCheckError,
+    SharedChange,
     TrialOutcome,
     chronological,
-    rate_change_pp,
+    shared_change,
     summarise_run,
     trial_outcome,
 )
@@ -79,7 +80,18 @@ def group(**overrides) -> GroupSummary:
         "fully_scored_passes": 1,
         "cases_passing_all": 1,
     } | overrides
-    return GroupSummary(**fields)
+    outcomes = scored_outcomes(fields["scored_trials"], passes=fields["passes"])
+    return GroupSummary(**(fields | {"scored_outcomes": outcomes}))
+
+
+def scored_outcomes(
+    count: int, *, passes: int, trials_per_case: int = 1
+) -> frozenset[tuple[str, int, bool]]:
+    """``count`` distinct ``(case_id, trial, passed)`` outcomes, the first ``passes`` passing."""
+    return frozenset(
+        (f"case-{index // trials_per_case}", index % trials_per_case + 1, index < passes)
+        for index in range(count)
+    )
 
 
 def multi_group(**overrides) -> GroupSummary:
@@ -95,7 +107,10 @@ def multi_group(**overrides) -> GroupSummary:
         "cases_passing_all": 1,
         "pass_distribution": (0, 1, 1),
     } | overrides
-    return GroupSummary(**fields)
+    outcomes = scored_outcomes(
+        fields["scored_trials"], passes=fields["passes"], trials_per_case=fields["trials_per_case"]
+    )
+    return GroupSummary(**(fields | {"scored_outcomes": outcomes}))
 
 
 @pytest.mark.parametrize("fault", [FaultClass.GRADER, FaultClass.INFRA, FaultClass.REFERENCE])
@@ -192,6 +207,7 @@ def test_a_run_is_scored_overall_and_per_tag() -> None:
         cases_with_excluded_trial=1,
         fully_scored_passes=2,
         cases_passing_all=2,
+        scored_outcomes=frozenset({("a", 1, True), ("b", 1, False), ("c", 1, True)}),
     )
     assert summary.all_cases.success_rate == pytest.approx(2 / 3)
     assert list(summary.by_tag) == ["corpus/dac.yaml", "corpus/imf.yaml"]
@@ -278,8 +294,10 @@ def test_change_is_the_success_rate_difference_in_percentage_points() -> None:
     before = group(passes=1, fully_scored_passes=1, cases_passing_all=1)
     after = group(passes=2, fully_scored_passes=2, cases_passing_all=2)
 
-    assert rate_change_pp(current=after, previous=before) == 50.0
-    assert rate_change_pp(current=before, previous=after) == -50.0
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=50.0, trials=2, partial=False
+    )
+    assert shared_change(current=before, previous=after).change_pp == -50.0
 
 
 def test_change_is_taken_between_the_rates_as_displayed() -> None:
@@ -293,7 +311,7 @@ def test_change_is_taken_between_the_rates_as_displayed() -> None:
         )
 
     # 33.34% shows as 33.3% and 33.36% as 33.4%, so the change must read +0.1 pp.
-    assert rate_change_pp(current=rate(3336), previous=rate(3334)) == 0.1
+    assert shared_change(current=rate(3336), previous=rate(3334)).change_pp == 0.1
 
 
 def test_a_group_without_a_rate_has_no_change() -> None:
@@ -306,7 +324,12 @@ def test_a_group_without_a_rate_has_no_change() -> None:
         cases_passing_all=0,
     )
 
-    assert rate_change_pp(current=empty, previous=group()) is None
+    assert shared_change(current=empty, previous=group()) == SharedChange(
+        change_pp=None, trials=0, partial=True
+    )
+    assert shared_change(current=empty, previous=empty) == SharedChange(
+        change_pp=None, trials=0, partial=False
+    )
 
 
 def test_runs_are_ordered_by_start_time_not_run_id() -> None:
@@ -388,3 +411,102 @@ def test_a_distribution_holding_the_wrong_number_of_passes_raises() -> None:
 def test_a_top_bucket_not_matching_cases_passing_all_raises() -> None:
     with pytest.raises(ValueError, match="top bucket 1 is not cases passing all 0"):
         multi_group(cases_passing_all=0)
+
+
+def test_a_group_carries_the_outcome_of_every_scored_trial() -> None:
+    run = make_run(
+        make_case(case_id="a", trial=1, tags=("dac",)),
+        make_case(case_id="a", trial=2, verdicts={}, fault=FaultClass.INFRA, tags=("dac",)),
+        make_case(case_id="b", trial=1, verdicts={HEADLINE: Verdict.FAIL}, tags=("imf",)),
+        make_case(case_id="b", trial=2, tags=("imf",)),
+    )
+
+    summary = summarise_run(run=run)
+
+    assert summary.all_cases.scored_outcomes == {("a", 1, True), ("b", 1, False), ("b", 2, True)}
+    assert summary.by_tag["dac"].scored_outcomes == {("a", 1, True)}
+    assert summary.by_tag["imf"].scored_outcomes == {("b", 1, False), ("b", 2, True)}
+
+
+def single_trial_group(outcomes: dict[str, bool]) -> GroupSummary:
+    """A single-trial group of fully scored cases with the given outcomes."""
+    passes = sum(outcomes.values())
+    return GroupSummary(
+        trials_per_case=1,
+        cases=len(outcomes),
+        scored_trials=len(outcomes),
+        passes=passes,
+        excluded_trials=0,
+        cases_with_excluded_trial=0,
+        fully_scored_passes=passes,
+        cases_passing_all=passes,
+        scored_outcomes=frozenset((case_id, 1, ok) for case_id, ok in outcomes.items()),
+    )
+
+
+def test_change_is_taken_over_the_trials_both_runs_scored() -> None:
+    before = single_trial_group({"a": True, "b": False, "c": False})
+    after = single_trial_group({"a": True, "b": True, "d": False})
+
+    # Over a and b: 50% before, 100% after, though the whole groups read 33.3% and 66.7%.
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=50.0, trials=2, partial=True
+    )
+
+
+def test_a_change_over_a_subset_of_one_run_is_partial() -> None:
+    before = single_trial_group({"a": True, "b": False})
+    after = single_trial_group({"a": False})
+
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=-100.0, trials=1, partial=True
+    )
+
+
+def test_groups_sharing_no_scored_trial_have_no_change() -> None:
+    before = single_trial_group({"a": True})
+    after = single_trial_group({"b": True})
+
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=None, trials=0, partial=True
+    )
+
+
+def test_scored_outcomes_not_matching_scored_trials_raise() -> None:
+    with pytest.raises(ValueError, match=r"1 scored .* pairs, not 2 scored trials"):
+        group_with_outcomes(frozenset({("a", 1, True)}))
+
+
+def test_scored_outcomes_not_matching_passes_raise() -> None:
+    with pytest.raises(ValueError, match="0 scored outcomes passed, not 1 passes"):
+        group_with_outcomes(frozenset({("a", 1, False), ("b", 1, False)}))
+
+
+def test_a_scored_trial_with_two_outcomes_raises() -> None:
+    with pytest.raises(ValueError, match="has two outcomes"):
+        group_with_outcomes(frozenset({("a", 1, True), ("a", 1, False)}))
+
+
+def group_with_outcomes(outcomes: frozenset[tuple[str, int, bool]]) -> GroupSummary:
+    """The reference single-trial group of two cases, one passing, with given outcomes."""
+    return GroupSummary(
+        trials_per_case=1,
+        cases=2,
+        scored_trials=2,
+        passes=1,
+        excluded_trials=0,
+        cases_with_excluded_trial=0,
+        fully_scored_passes=1,
+        cases_passing_all=1,
+        scored_outcomes=outcomes,
+    )
+
+
+def test_a_partial_change_is_rounded_once() -> None:
+    """Over three shared trials, 1 of 3 to 2 of 3 is +33.3 pp, not 66.7 - 33.3."""
+    before = single_trial_group({"a": True, "b": False, "c": False, "d": True})
+    after = single_trial_group({"a": True, "b": True, "c": False})
+
+    assert shared_change(current=after, previous=before) == SharedChange(
+        change_pp=33.3, trials=3, partial=True
+    )

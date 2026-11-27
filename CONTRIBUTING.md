@@ -19,7 +19,15 @@ just check    # lint, type check, test: CI's lint and test jobs
 just format   # apply ruff fixes and formatting
 ```
 
-CI runs `lint` and `test` on every ready pull request, with `test` on Python 3.12 and 3.13. `just check` covers both on your local Python. CI skips draft pull requests.
+CI runs `lint`, `test` and `test-lowest` on every ready pull request, with `test` on Python 3.12 and 3.13. `just check` covers `lint` and `test` on the Python in `.python-version` (3.12). CI skips draft pull requests.
+
+`test-lowest` runs the tests against the lowest versions of the direct dependencies that `pyproject.toml` allows. To reproduce it locally:
+
+```bash
+uv run --resolution lowest-direct --all-extras --isolated pytest
+```
+
+This runs in a temporary environment on the Python in `.python-version`, as the CI job does on 3.12, and leaves `uv.lock` and `.venv` as they are. The `dev` group already holds both extras, so `--all-extras` installs the same packages the CI job does.
 
 Pre-commit runs ruff, `ty`, codespell, actionlint, and mdformat. Ruff and `ty` settings are in `pyproject.toml`.
 

@@ -113,9 +113,11 @@ def run_from_report(
 
     Raises:
         ValueError: The report holds output from report-level evaluators, an evaluator
-            is named ``task``, a case has no name, a case and trial appear twice,
-            trials of a case carry different tags, a case lacks the headline check, a
-            label is not a verdict, or an evaluator returned a numeric score.
+            is named ``task``, a case has no name, a case and trial appear twice, a
+            label is not a verdict, or an evaluator returned a numeric score. ``Run``
+            refuses the results, with a pydantic ``ValidationError``, when trials of a
+            case carry different tags or different input digests, cases hold different
+            numbers of trials, or a scored trial lacks the headline check.
     """
     _reject_report_evaluator_output(report)
     results = [

@@ -64,6 +64,7 @@ class GroupSummary:
         cases_with_excluded_trial: Cases with at least one excluded trial.
         fully_scored_passes: Passing trials of fully scored cases.
         cases_passing_all: Fully scored cases whose trials all pass.
+        scored_outcomes: ``(case_id, trial, passed)`` for every scored trial.
         pass_distribution: Count of fully scored cases by number of passing trials,
             index 0 to ``trials_per_case``; None for single-trial runs.
     """
@@ -76,6 +77,7 @@ class GroupSummary:
     cases_with_excluded_trial: int
     fully_scored_passes: int
     cases_passing_all: int
+    scored_outcomes: frozenset[tuple[str, int, bool]]
     pass_distribution: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -119,8 +121,18 @@ class GroupSummary:
                 f"scored {self.scored_trials} plus excluded {self.excluded_trials} trials is "
                 f"not {self.cases} cases of {self.trials_per_case} trials"
             )
+        pairs = {(case_id, trial) for case_id, trial, _ in self.scored_outcomes}
+        if len(pairs) != len(self.scored_outcomes):
+            raise ValueError("a scored (case_id, trial) pair has two outcomes")
+        if len(pairs) != self.scored_trials:
+            raise ValueError(
+                f"{len(pairs)} scored (case_id, trial) pairs, "
+                f"not {self.scored_trials} scored trials"
+            )
         if self.passes > self.scored_trials:
             raise ValueError(f"passes {self.passes} exceed scored trials {self.scored_trials}")
+        if (passed := sum(1 for *_, ok in self.scored_outcomes if ok)) != self.passes:
+            raise ValueError(f"{passed} scored outcomes passed, not {self.passes} passes")
         if self.cases_with_excluded_trial > min(self.cases, self.excluded_trials):
             raise ValueError(
                 f"{self.cases_with_excluded_trial} cases with an excluded trial, but only "
@@ -259,12 +271,12 @@ def trial_outcome(*, result: CaseResult, headline_check: str | None) -> TrialOut
 
 
 def summarise_group(
-    *, outcomes: Sequence[tuple[str, TrialOutcome]], trials_per_case: int
+    *, outcomes: Sequence[tuple[str, int, TrialOutcome]], trials_per_case: int
 ) -> GroupSummary:
     """Score one group of trials.
 
     Args:
-        outcomes: One ``(case_id, outcome)`` pair per trial in the group.
+        outcomes: One ``(case_id, trial, outcome)`` triple per trial in the group.
         trials_per_case: Trials every case in the run has; above one, the summary
             carries the distribution of cases by passing trials.
 
@@ -275,7 +287,7 @@ def summarise_group(
         ValueError: A case does not have ``trials_per_case`` trials.
     """
     by_case: defaultdict[str, Counter[TrialOutcome]] = defaultdict(Counter)
-    for case_id, outcome in outcomes:
+    for case_id, _, outcome in outcomes:
         by_case[case_id][outcome] += 1
     uneven = sorted(case for case, counts in by_case.items() if counts.total() != trials_per_case)
     if uneven:
@@ -287,7 +299,7 @@ def summarise_group(
         passes_per_case = Counter(counts[TrialOutcome.PASS] for counts in fully_scored)
         distribution = tuple(passes_per_case[count] for count in range(trials_per_case + 1))
 
-    totals = Counter(outcome for _, outcome in outcomes)
+    totals = Counter(outcome for _, _, outcome in outcomes)
     return GroupSummary(
         trials_per_case=trials_per_case,
         cases=len(by_case),
@@ -297,6 +309,11 @@ def summarise_group(
         cases_with_excluded_trial=len(by_case) - len(fully_scored),
         fully_scored_passes=sum(counts[TrialOutcome.PASS] for counts in fully_scored),
         cases_passing_all=sum(1 for counts in fully_scored if not counts[TrialOutcome.FAIL]),
+        scored_outcomes=frozenset(
+            (case_id, trial, outcome is TrialOutcome.PASS)
+            for case_id, trial, outcome in outcomes
+            if outcome is not TrialOutcome.EXCLUDED
+        ),
         pass_distribution=distribution,
     )
 
@@ -319,14 +336,15 @@ def summarise_run(*, run: Run) -> RunSummary:
         Counter(result.case_id for result in run.results).values(), default=_SINGLE_TRIAL
     )
 
-    all_outcomes: list[tuple[str, TrialOutcome]] = []
-    tag_outcomes: defaultdict[str, list[tuple[str, TrialOutcome]]] = defaultdict(list)
+    all_outcomes: list[tuple[str, int, TrialOutcome]] = []
+    tag_outcomes: defaultdict[str, list[tuple[str, int, TrialOutcome]]] = defaultdict(list)
     for result in run.results:
         # Run rejects a trial lacking its headline check, so this cannot raise.
-        pair = (result.case_id, trial_outcome(result=result, headline_check=headline_check))
-        all_outcomes.append(pair)
+        outcome = trial_outcome(result=result, headline_check=headline_check)
+        triple = (result.case_id, result.trial, outcome)
+        all_outcomes.append(triple)
         for tag in dict.fromkeys(result.tags):
-            tag_outcomes[tag].append(pair)
+            tag_outcomes[tag].append(triple)
 
     # Every tag group's cases are a subset of all cases, so checking here covers them.
     try:
@@ -349,24 +367,60 @@ def display_percent(rate: float | None) -> float | None:
     return None if rate is None else round(rate * PERCENT, PERCENT_DECIMALS)
 
 
-def rate_change_pp(*, current: GroupSummary, previous: GroupSummary) -> float | None:
-    """Change in success rate between two runs, in percentage points.
+@dataclass(frozen=True)
+class SharedChange:
+    """Change in success rate over the trials two runs of a group both scored.
 
-    The change is taken between the rates as displayed, so it always agrees with them.
+    Attributes:
+        change_pp: Success rate over the shared trials in the later run minus that in
+            the earlier run, in percentage points, or None with no shared trials.
+        trials: ``(case_id, trial)`` pairs both runs scored.
+        partial: Whether either run scored a trial the other did not.
+    """
+
+    change_pp: float | None
+    trials: int
+    partial: bool
+
+
+def shared_change(*, current: GroupSummary, previous: GroupSummary) -> SharedChange:
+    """Change in success rate between two runs over the trials both scored.
+
+    When both runs scored the same pairs, each run's rate is its group's success rate,
+    rounded as the page shows it before taking the difference, so the change agrees with
+    the rates on the page. Otherwise neither shared rate is shown, so the difference of
+    the unrounded rates is rounded once.
 
     Args:
         current: The group in the later run.
         previous: The same group in the earlier run.
 
     Returns:
-        The displayed current rate minus the displayed previous rate, or None when
-        either rate is missing.
+        The change, the number of shared trials, and whether they fall short of either
+        run's scored trials.
     """
-    now = display_percent(current.success_rate)
-    before = display_percent(previous.success_rate)
-    if now is None or before is None:
-        return None
-    return round(now - before, PERCENT_DECIMALS)
+    now = _passed_by_pair(current)
+    before = _passed_by_pair(previous)
+    shared = now.keys() & before.keys()
+    partial = len(shared) < len(now) or len(shared) < len(before)
+    now_share = _share(sum(now[pair] for pair in shared), len(shared))
+    before_share = _share(sum(before[pair] for pair in shared), len(shared))
+    if now_share is None or before_share is None:
+        return SharedChange(change_pp=None, trials=0, partial=partial)
+    if partial:
+        change = (now_share - before_share) * PERCENT
+    else:
+        change = round(now_share * PERCENT, PERCENT_DECIMALS) - round(
+            before_share * PERCENT, PERCENT_DECIMALS
+        )
+    return SharedChange(
+        change_pp=round(change, PERCENT_DECIMALS), trials=len(shared), partial=partial
+    )
+
+
+def _passed_by_pair(group: GroupSummary) -> dict[tuple[str, int], bool]:
+    """Whether each scored ``(case_id, trial)`` pair of a group passed."""
+    return {(case_id, trial): passed for case_id, trial, passed in group.scored_outcomes}
 
 
 def chronological(summaries: Iterable[RunSummary]) -> list[RunSummary]:

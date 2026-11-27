@@ -22,7 +22,7 @@ from dfo_evals.summary import (
     RunSummary,
     chronological,
     display_percent,
-    rate_change_pp,
+    shared_change,
     summarise_run,
 )
 
@@ -40,6 +40,12 @@ CORPUS_CHANGED: Final = "corpus changed"
 # A change cell whose previous run named another headline check, so its trials passed
 # by another rule.
 HEADLINE_CHANGED: Final = "headline changed"
+# A change cell whose group shares no scored (case_id, trial) pair with the previous run.
+NO_SHARED_TRIALS: Final = "no trials scored in both"
+# Follows a change taken over only some of either run's scored trials.
+SHARED_TRIALS_PREFIX: Final = "over"
+SHARED_TRIAL: Final = "trial"
+SHARED_TRIALS: Final = "trials"
 UNREADABLE_HEADING: Final = "Unreadable runs"
 MINUS_SIGN: Final = "\N{MINUS SIGN}"
 RANGE_SEPARATOR: Final = "\N{EN DASH}"
@@ -110,8 +116,8 @@ def build_page(*, root: Path) -> Page:
     Args:
         root: Directory holding ``<suite>/<run_id>/`` run records.
 
-    A run that fails to read, such as one of another schema version or one missing its
-    results file, is left out and listed at the end of the page, so one bad run leaves
+    A run that fails to read, such as one of a newer schema version or one whose results
+    file is missing or cannot be opened, is left out and listed at the end of the page, so one bad run leaves
     every other run on the page. The log names it by suite and run directory only, since
     a validation error can quote record contents. Callers report a page that left runs
     out as a failure once it is written.
@@ -128,7 +134,7 @@ def build_page(*, root: Path) -> Page:
     for run_dir in iter_runs(root=root):
         try:
             run = read_run(run_dir)
-        except (RecordSchemaError, FileNotFoundError) as error:
+        except (RecordSchemaError, OSError) as error:
             name = f"{run_dir.parent.name}/{run_dir.name}"
             logger.warning("left out unreadable run %s (%s)", name, type(error).__name__)
             unreadable.append(name)
@@ -329,12 +335,21 @@ def _change_cell(
     """Render a change cell; colour backs up the sign, never replaces it.
 
     A change against a run it cannot be compared with shows the reason, uncoloured.
+    Otherwise the change is taken over the ``(case_id, trial)`` pairs both runs of the
+    group scored. When those fall short of either run's scored trials, the cell names
+    how many trials it compares, or shows ``NO_SHARED_TRIALS`` when there are none.
     """
     if previous is None:
         return _num(NO_PREVIOUS)
     if incomparable is not None:
         return _num(incomparable)
-    text = format_change(rate_change_pp(current=current, previous=previous))
+    change = shared_change(current=current, previous=previous)
+    if change.partial and change.trials == 0:
+        return _num(NO_SHARED_TRIALS)
+    text = format_change(change.change_pp)
+    if change.partial:
+        noun = SHARED_TRIAL if change.trials == 1 else SHARED_TRIALS
+        text = f"{text} {SHARED_TRIALS_PREFIX} {change.trials} {noun}"
     if text.startswith("+"):
         return f'<td class="num up">{escape(text)}</td>'
     if text.startswith(MINUS_SIGN):
@@ -381,8 +396,9 @@ def _document(body: str) -> str:
             "</main>",
             "<footer><p>Success rate is passes over scored trials. Change is in percentage "
             "points against the previous run of the same suite, shown only when both runs scored the "
-            "same corpus by the same headline check. Tags can overlap, so group rows need not "
-            "add up to All cases.</p></footer>",
+            "same corpus by the same headline check. It compares success rates over the trials "
+            "both runs scored, and says how many trials that is when either run scored others. "
+            "Tags can overlap, so group rows need not add up to All cases.</p></footer>",
             "</body>",
             "</html>",
             "",
