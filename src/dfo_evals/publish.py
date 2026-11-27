@@ -6,9 +6,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from google.api_core.exceptions import GoogleAPIError
-from google.auth.exceptions import GoogleAuthError
-from google.cloud import storage
+try:
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
+    from google.cloud import storage
+except ModuleNotFoundError as error:
+    raise ModuleNotFoundError(
+        f"dfo_evals.publish needs the storage extra (dfo-evals[storage]): {error}"
+    ) from error
 from pydantic import TypeAdapter, ValidationError
 
 from dfo_evals.page import build_page

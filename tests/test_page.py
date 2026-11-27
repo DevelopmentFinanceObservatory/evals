@@ -13,6 +13,7 @@ from dfo_evals.page import (
     MINUS_SIGN,
     NO_PREVIOUS,
     RANGE_SEPARATOR,
+    UNREADABLE_HEADING,
     build_page,
     main,
 )
@@ -262,7 +263,7 @@ def test_the_cli_errors_on_an_empty_root(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     root.mkdir()
 
-    with pytest.raises(ValueError, match="no runs found"):
+    with pytest.raises(ValueError, match="no readable runs"):
         main(["--root", str(root), "--out", str(tmp_path / "index.html")])
 
 
@@ -274,3 +275,25 @@ def test_a_change_of_headline_check_is_marked_and_each_run_keeps_its_own(tmp_pat
 
     assert group_row(page, "All cases")[:3] == ["2", "50.0%", HEADLINE_CHANGED]
     assert "headline check <code>answer_v2</code> passes" in page
+
+
+def test_an_unreadable_run_is_listed_and_every_other_run_is_shown(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True]})
+    save_run(tmp_path, day=1, passes={DAC: [True]}, suite="other")
+    manifest = tmp_path / "other" / "night-001" / "manifest.json"
+    manifest.write_text(manifest.read_text().replace('"revision"', '"added_field": 1, "revision"'))
+
+    page = build_page(root=tmp_path)
+
+    assert 'id="suite-apis-search"' in page
+    assert 'id="suite-other"' not in page
+    assert f"<h2>{UNREADABLE_HEADING}</h2>" in page
+    assert "<li><code>other/night-001</code></li>" in page
+
+
+def test_a_root_of_only_unreadable_runs_raises_naming_them(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True]})
+    (tmp_path / "apis-search" / "night-001" / "results.jsonl").unlink()
+
+    with pytest.raises(ValueError, match="apis-search/night-001"):
+        build_page(root=tmp_path)
