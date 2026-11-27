@@ -9,6 +9,7 @@ import argparse
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
@@ -95,19 +96,28 @@ footer { margin-top: 2rem; border-top: 1px solid var(--rule); padding-top: 0.5re
 """
 
 
-def build_page(*, root: Path) -> str:
+@dataclass(frozen=True)
+class Page:
+    """A built results page and the runs it left out, as ``<suite>/<run_id>``."""
+
+    html: str
+    unreadable: tuple[str, ...]
+
+
+def build_page(*, root: Path) -> Page:
     """Build the results page from every run under a root.
 
     Args:
         root: Directory holding ``<suite>/<run_id>/`` run records.
 
     A run that fails to read, such as one of another schema version or one missing its
-    results, is left out and listed at the end of the page, so one bad run leaves every
-    other run on the page. The log names it by suite and run directory only, since a
-    validation error can quote record contents.
+    results file, is left out and listed at the end of the page, so one bad run leaves
+    every other run on the page. The log names it by suite and run directory only, since
+    a validation error can quote record contents. Callers report a page that left runs
+    out as a failure once it is written.
 
     Returns:
-        One self-contained HTML document.
+        One self-contained HTML document and the runs it left out.
 
     Raises:
         ValueError: The root holds no readable runs.
@@ -138,7 +148,7 @@ def build_page(*, root: Path) -> str:
     ]
     if unreadable:
         sections.append(_unreadable_section(unreadable))
-    return _document("\n".join(sections))
+    return Page(html=_document("\n".join(sections)), unreadable=tuple(unreadable))
 
 
 def _unreadable_section(names: Sequence[str]) -> str:
@@ -397,7 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Command-line arguments, or None for ``sys.argv``.
 
     Returns:
-        Process exit code, 0 on success.
+        Process exit code: 0 on success, 1 when the page left out unreadable runs.
 
     Raises:
         ValueError: The root holds no runs.
@@ -408,8 +418,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     page = build_page(root=args.root)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(page)
+        handle.write(page.html)
     logger.info("wrote %s", args.out)
+    if page.unreadable:
+        logger.error("the page left out unreadable runs: %s", ", ".join(page.unreadable))
+        return 1
     return 0
 
 

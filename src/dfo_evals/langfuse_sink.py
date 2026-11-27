@@ -419,8 +419,14 @@ def push_run(
         case_id: _case_output(case_id, results, outputs) for case_id, results in by_case.items()
     }
 
+    project_id = _sole_project_id(client)
     held = _read_pushed(
-        client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+        client=client,
+        run=run,
+        run_name=run_name,
+        groups=groups,
+        project_id=project_id,
+        input_digests=input_digests,
     )
     for case_id, item_run in held.items():
         if item_run.case_digest != _case_digest(by_case[case_id]):
@@ -433,7 +439,6 @@ def push_run(
             )
 
     pending = [case_id for case_id in by_case if case_id not in held]
-    project_id = _sole_project_id(client)
     for group in groups:
         if not (sending := [case_id for case_id in group.items if case_id not in held]):
             continue
@@ -471,6 +476,7 @@ def push_run(
             run=run,
             run_name=run_name,
             groups=groups,
+            project_id=project_id,
             input_digests=input_digests,
             timeout_s=timeout_s,
             cases_only=True,
@@ -503,6 +509,7 @@ def push_run(
         run=run,
         run_name=run_name,
         groups=groups,
+        project_id=project_id,
         input_digests=input_digests,
         timeout_s=max(0.0, deadline - time.monotonic()),
     )
@@ -538,6 +545,7 @@ def verify_pushed(
 
     Raises:
         UnknownCaseError: A case has no item in the dataset it maps to.
+        WrongProjectError: The client's keys name no project or more than one.
         InputMismatchError: A case's item input is not the input the run evaluated.
         ValueError: Two cases map to one item, or a case's trials hold different input
             digests.
@@ -549,11 +557,13 @@ def verify_pushed(
     input_digests = _case_input_digests(by_case)
     groups = _group_cases(client=client, case_ids=list(by_case), item_of=item_of)
     _check_inputs(groups=groups, input_digests=input_digests)
+    project_id = _sole_project_id(client)
     _, missing = _await_visible(
         client=client,
         run=run,
         run_name=run_name,
         groups=groups,
+        project_id=project_id,
         input_digests=input_digests,
         timeout_s=timeout_s,
     )
@@ -570,6 +580,7 @@ def _await_visible(
     run: Run,
     run_name: str,
     groups: Sequence[_DatasetCases],
+    project_id: str,
     input_digests: Mapping[str, str],
     timeout_s: float,
     cases_only: bool = False,
@@ -596,7 +607,12 @@ def _await_visible(
     deadline = time.monotonic() + timeout_s
     while True:
         held = _read_pushed(
-            client=client, run=run, run_name=run_name, groups=groups, input_digests=input_digests
+            client=client,
+            run=run,
+            run_name=run_name,
+            groups=groups,
+            project_id=project_id,
+            input_digests=input_digests,
         )
         _check_matches(
             held=held, digests=expected_digests, scores=expected_scores, run_name=run_name
@@ -719,6 +735,7 @@ def _read_pushed(
     run: Run,
     run_name: str,
     groups: Sequence[_DatasetCases],
+    project_id: str,
     input_digests: Mapping[str, str],
 ) -> dict[str, _ItemRun]:
     """Read the item runs Langfuse shows under an experiment in each dataset, by case id.
@@ -729,7 +746,6 @@ def _read_pushed(
             or holds another input than the run evaluated.
     """
     found: dict[str, _ItemRun] = {}
-    project_id = _sole_project_id(client)
     for group in groups:
         shown = _read_experiment_items(
             client=client,
