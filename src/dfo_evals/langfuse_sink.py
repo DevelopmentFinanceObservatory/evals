@@ -721,7 +721,9 @@ def _send(
 
     ``run_experiment`` runs in an empty OpenTelemetry context. Its item spans would
     otherwise become children of the caller's current span, and under an unsampled
-    parent langfuse records none of them while still returning every item result.
+    parent langfuse records none of them while still returning every item result. The
+    empty context also drops the caller's baggage, and each item's trace is a root
+    trace, not a child of the caller's span. The caller's context is restored after.
     """
 
     def task(*, item: ExperimentItem, **_: object) -> object:

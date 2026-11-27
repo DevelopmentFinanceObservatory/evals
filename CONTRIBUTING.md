@@ -24,11 +24,10 @@ CI runs `lint`, `test` and `test-lowest` on every ready pull request, with `test
 `test-lowest` runs the tests against the lowest versions of the direct dependencies that `pyproject.toml` allows. To reproduce it locally:
 
 ```bash
-uv sync --resolution lowest-direct
-uv run --no-sync pytest
+uv run --resolution lowest-direct --all-extras --isolated pytest
 ```
 
-The sync rewrites `uv.lock` to those versions. Afterwards, restore it with `git checkout uv.lock` and run `just sync` to return to the locked versions.
+This runs in a temporary environment on the Python in `.python-version`, as the CI job does on 3.12, and leaves `uv.lock` and `.venv` as they are. The `dev` group already holds both extras, so `--all-extras` installs the same packages the CI job does.
 
 Pre-commit runs ruff, `ty`, codespell, actionlint, and mdformat. Ruff and `ty` settings are in `pyproject.toml`.
 

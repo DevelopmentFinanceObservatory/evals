@@ -13,8 +13,8 @@ from dfo_evals.page import (
     HISTORY_LIMIT,
     MINUS_SIGN,
     NO_PREVIOUS,
+    NO_SHARED_TRIALS,
     RANGE_SEPARATOR,
-    SCORED_TRIALS_CHANGED,
     UNREADABLE_HEADING,
     build_page,
     main,
@@ -341,19 +341,58 @@ def history_row(page: str, run_id: str) -> list[str]:
     return re.findall(r"<td[^>]*>(.*?)</td>", row)
 
 
-def test_a_trial_newly_excluded_replaces_the_change_with_a_flag(tmp_path: Path) -> None:
+def test_a_trial_newly_excluded_leaves_the_change_over_the_trials_both_runs_scored(
+    tmp_path: Path,
+) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True, False, True]})
+    save_run(tmp_path, day=2, passes={DAC: [True, None, False]})
+
+    page = build_page(root=tmp_path).html
+
+    # The whole rate reads 66.7% then 50.0%; over DAC-0 and DAC-2 it falls from 100% to 50%.
+    expected = f"{MINUS_SIGN}50.0 pp over 2 trials"
+    assert group_row(page, "All cases")[1:3] == ["50.0%", expected]
+    assert group_row(page, DAC)[2] == expected
+    assert history_row(page, "night-002")[-1] == expected
+    assert '<td class="num down">' + expected + "</td>" in page
+
+
+def test_an_excluded_failing_trial_shows_no_false_gain(tmp_path: Path) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True, False]})
     save_run(tmp_path, day=2, passes={DAC: [True, None]})
 
     page = build_page(root=tmp_path).html
 
-    assert group_row(page, "All cases")[1:3] == ["100.0%", SCORED_TRIALS_CHANGED]
-    assert group_row(page, DAC)[2] == SCORED_TRIALS_CHANGED
-    assert history_row(page, "night-002")[-1] == SCORED_TRIALS_CHANGED
+    assert group_row(page, "All cases")[1:3] == ["100.0%", "0.0 pp over 1 trial"]
     assert 'class="num up"' not in page
 
 
-def test_a_tag_whose_cases_changed_replaces_its_change_with_a_flag(tmp_path: Path) -> None:
+def test_a_tag_that_gained_a_case_shows_the_change_over_its_shared_trials(tmp_path: Path) -> None:
+    save_results(
+        tmp_path,
+        day=1,
+        results=(
+            make_case(case_id="a", passed=False, tags=(DAC,)),
+            make_case(case_id="b", passed=True, tags=(IMF,)),
+        ),
+    )
+    save_results(
+        tmp_path,
+        day=2,
+        results=(
+            make_case(case_id="a", passed=True, tags=(DAC,)),
+            make_case(case_id="b", passed=True, tags=(DAC,)),
+        ),
+    )
+
+    page = build_page(root=tmp_path).html
+
+    assert group_row(page, "All cases")[2] == "+50.0 pp"
+    assert group_row(page, DAC)[1:3] == ["100.0%", "+100.0 pp over 1 trial"]
+    assert history_row(page, "night-002")[-1] == "+50.0 pp"
+
+
+def test_a_group_sharing_no_scored_trial_shows_a_flag(tmp_path: Path) -> None:
     save_results(
         tmp_path,
         day=1,
@@ -366,7 +405,7 @@ def test_a_tag_whose_cases_changed_replaces_its_change_with_a_flag(tmp_path: Pat
         tmp_path,
         day=2,
         results=(
-            make_case(case_id="a", passed=True, tags=(DAC,)),
+            make_case(case_id="a", passed=True, tags=(IMF,)),
             make_case(case_id="b", passed=False, tags=(DAC,)),
         ),
     )
@@ -374,11 +413,22 @@ def test_a_tag_whose_cases_changed_replaces_its_change_with_a_flag(tmp_path: Pat
     page = build_page(root=tmp_path).html
 
     assert group_row(page, "All cases")[2] == "0.0 pp"
-    assert group_row(page, DAC)[1:3] == ["50.0%", SCORED_TRIALS_CHANGED]
-    assert history_row(page, "night-002")[-1] == "0.0 pp"
+    assert group_row(page, DAC)[2] == NO_SHARED_TRIALS
+    assert group_row(page, IMF)[2] == NO_SHARED_TRIALS
 
 
-def test_a_change_of_corpus_or_headline_outranks_changed_scored_trials(tmp_path: Path) -> None:
+def test_a_history_run_sharing_no_scored_trial_shows_a_flag(tmp_path: Path) -> None:
+    save_run(tmp_path, day=1, passes={DAC: [True]})
+    save_run(tmp_path, day=2, passes={IMF: [True]})
+
+    page = build_page(root=tmp_path).html
+
+    assert history_row(page, "night-002")[-1] == NO_SHARED_TRIALS
+
+
+def test_a_change_of_corpus_or_headline_outranks_a_change_of_scored_trials(
+    tmp_path: Path,
+) -> None:
     save_run(tmp_path, day=1, passes={DAC: [True, False]})
     save_run(tmp_path, day=2, passes={DAC: [True]}, headline_check="answer_v2")
     save_run(tmp_path, day=3, passes={DAC: [True, False]}, dataset_digest="sha256:other")
@@ -389,12 +439,13 @@ def test_a_change_of_corpus_or_headline_outranks_changed_scored_trials(tmp_path:
     assert history_row(page, "night-003")[-1] == CORPUS_CHANGED
 
 
-def test_the_footer_says_when_a_change_is_shown(two_runs: Path) -> None:
+def test_the_footer_says_how_a_change_is_taken(two_runs: Path) -> None:
     page = build_page(root=two_runs).html
 
     assert (
-        "shown only when both runs scored the same corpus by the same headline check and "
-        "the group scored the same trials of the same cases in both."
+        "shown only when both runs scored the same corpus by the same headline check. It "
+        "compares success rates over the trials both runs scored, and says how many trials "
+        "that is when either run scored others."
     ) in page
 
 

@@ -333,6 +333,25 @@ def test_a_manifest_whose_schema_version_is_no_valid_integer_is_refused(
         read_run(run_dir)
 
 
+def test_a_manifest_without_a_schema_version_is_refused_as_missing(tmp_path: Path) -> None:
+    run_dir = write_run(root=tmp_path, run=make_run())
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["schema_version"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RecordSchemaError, match="schema_version is missing"):
+        read_run(run_dir)
+
+
+def test_a_manifest_that_is_not_a_json_object_is_refused(tmp_path: Path) -> None:
+    run_dir = write_run(root=tmp_path, run=make_run())
+    (run_dir / "manifest.json").write_text("[1]", encoding="utf-8")
+
+    with pytest.raises(RecordSchemaError, match="not a JSON object"):
+        read_run(run_dir)
+
+
 def test_a_written_manifest_holds_the_current_schema_version(tmp_path: Path) -> None:
     run_dir = write_run(root=tmp_path, run=make_run())
 

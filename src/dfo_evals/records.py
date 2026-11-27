@@ -424,7 +424,11 @@ def _read_manifest(path: Path) -> RunManifest:
         raw = json.loads(text)
     except json.JSONDecodeError as error:
         raise RecordSchemaError(f"{path}: not valid JSON: {error}") from error
-    version = raw.get("schema_version") if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        raise RecordSchemaError(f"{path}: not a JSON object")
+    if "schema_version" not in raw:
+        raise RecordSchemaError(f"{path}: schema_version is missing")
+    version = raw["schema_version"]
     # bool is an int subclass, but true is no version.
     if not isinstance(version, int) or isinstance(version, bool) or version < FIRST_SCHEMA_VERSION:
         raise RecordSchemaError(

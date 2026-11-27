@@ -64,7 +64,7 @@ class GroupSummary:
         cases_with_excluded_trial: Cases with at least one excluded trial.
         fully_scored_passes: Passing trials of fully scored cases.
         cases_passing_all: Fully scored cases whose trials all pass.
-        scored_pairs: The ``(case_id, trial)`` pair of every scored trial.
+        scored_outcomes: ``(case_id, trial, passed)`` for every scored trial.
         pass_distribution: Count of fully scored cases by number of passing trials,
             index 0 to ``trials_per_case``; None for single-trial runs.
     """
@@ -77,7 +77,7 @@ class GroupSummary:
     cases_with_excluded_trial: int
     fully_scored_passes: int
     cases_passing_all: int
-    scored_pairs: frozenset[tuple[str, int]]
+    scored_outcomes: frozenset[tuple[str, int, bool]]
     pass_distribution: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -121,13 +121,18 @@ class GroupSummary:
                 f"scored {self.scored_trials} plus excluded {self.excluded_trials} trials is "
                 f"not {self.cases} cases of {self.trials_per_case} trials"
             )
-        if len(self.scored_pairs) != self.scored_trials:
+        pairs = {(case_id, trial) for case_id, trial, _ in self.scored_outcomes}
+        if len(pairs) != len(self.scored_outcomes):
+            raise ValueError("a scored (case_id, trial) pair has two outcomes")
+        if len(pairs) != self.scored_trials:
             raise ValueError(
-                f"{len(self.scored_pairs)} scored (case_id, trial) pairs, "
+                f"{len(pairs)} scored (case_id, trial) pairs, "
                 f"not {self.scored_trials} scored trials"
             )
         if self.passes > self.scored_trials:
             raise ValueError(f"passes {self.passes} exceed scored trials {self.scored_trials}")
+        if (passed := sum(1 for *_, ok in self.scored_outcomes if ok)) != self.passes:
+            raise ValueError(f"{passed} scored outcomes passed, not {self.passes} passes")
         if self.cases_with_excluded_trial > min(self.cases, self.excluded_trials):
             raise ValueError(
                 f"{self.cases_with_excluded_trial} cases with an excluded trial, but only "
@@ -304,8 +309,8 @@ def summarise_group(
         cases_with_excluded_trial=len(by_case) - len(fully_scored),
         fully_scored_passes=sum(counts[TrialOutcome.PASS] for counts in fully_scored),
         cases_passing_all=sum(1 for counts in fully_scored if not counts[TrialOutcome.FAIL]),
-        scored_pairs=frozenset(
-            (case_id, trial)
+        scored_outcomes=frozenset(
+            (case_id, trial, outcome is TrialOutcome.PASS)
             for case_id, trial, outcome in outcomes
             if outcome is not TrialOutcome.EXCLUDED
         ),
@@ -362,24 +367,55 @@ def display_percent(rate: float | None) -> float | None:
     return None if rate is None else round(rate * PERCENT, PERCENT_DECIMALS)
 
 
-def rate_change_pp(*, current: GroupSummary, previous: GroupSummary) -> float | None:
-    """Change in success rate between two runs, in percentage points.
+@dataclass(frozen=True)
+class SharedChange:
+    """Change in success rate over the trials two runs of a group both scored.
 
-    The change is taken between the rates as displayed, so it always agrees with them.
+    Attributes:
+        change_pp: Success rate over the shared trials in the later run minus that in
+            the earlier run, in percentage points, or None with no shared trials.
+        trials: ``(case_id, trial)`` pairs both runs scored.
+        partial: Whether either run scored a trial the other did not.
+    """
+
+    change_pp: float | None
+    trials: int
+    partial: bool
+
+
+def shared_change(*, current: GroupSummary, previous: GroupSummary) -> SharedChange:
+    """Change in success rate between two runs over the trials both scored.
+
+    Each run's rate over the shared ``(case_id, trial)`` pairs is rounded as the page
+    shows a rate before taking the difference. When both runs scored the same pairs,
+    those rates are the groups' success rates, so the change agrees with them.
 
     Args:
         current: The group in the later run.
         previous: The same group in the earlier run.
 
     Returns:
-        The displayed current rate minus the displayed previous rate, or None when
-        either rate is missing.
+        The change, the number of shared trials, and whether they fall short of either
+        run's scored trials.
     """
-    now = display_percent(current.success_rate)
-    before = display_percent(previous.success_rate)
-    if now is None or before is None:
-        return None
-    return round(now - before, PERCENT_DECIMALS)
+    now = _passed_by_pair(current)
+    before = _passed_by_pair(previous)
+    shared = now.keys() & before.keys()
+    partial = len(shared) < len(now) or len(shared) < len(before)
+    now_rate = display_percent(_share(sum(now[pair] for pair in shared), len(shared)))
+    before_rate = display_percent(_share(sum(before[pair] for pair in shared), len(shared)))
+    if now_rate is None or before_rate is None:
+        return SharedChange(change_pp=None, trials=0, partial=partial)
+    return SharedChange(
+        change_pp=round(now_rate - before_rate, PERCENT_DECIMALS),
+        trials=len(shared),
+        partial=partial,
+    )
+
+
+def _passed_by_pair(group: GroupSummary) -> dict[tuple[str, int], bool]:
+    """Whether each scored ``(case_id, trial)`` pair of a group passed."""
+    return {(case_id, trial): passed for case_id, trial, passed in group.scored_outcomes}
 
 
 def chronological(summaries: Iterable[RunSummary]) -> list[RunSummary]:

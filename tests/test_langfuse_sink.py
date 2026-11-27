@@ -7,9 +7,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langfuse import Langfuse
 from langfuse.api import DatasetItem, DatasetStatus, NotFoundError
 from opentelemetry import trace as otel_trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 
 from dfo_evals.langfuse_sink import (
@@ -22,6 +26,7 @@ from dfo_evals.langfuse_sink import (
     UnknownCaseError,
     WrongProjectError,
     _read_back_input_matches,
+    _send,
     check_project,
     connect,
     push_run,
@@ -1151,3 +1156,51 @@ def test_a_push_under_an_unsampled_span_sends_its_item_runs_in_a_fresh_trace() -
         _push(fake, _TWO_CASES)
 
     assert fake.parent_spans == [False]
+
+
+# Nothing listens here, so the client's API calls fail at once.
+_OFFLINE_URL = "http://127.0.0.1:9"
+
+
+def test_the_real_client_records_item_runs_sent_under_an_unsampled_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """langfuse's own run_experiment records the item spans and restores the caller's span."""
+    monkeypatch.delenv("LANGFUSE_TRACING_ENABLED", raising=False)
+    # The client's own OTLP exporter would retry the offline URL for seconds.
+    monkeypatch.setattr(OTLPSpanExporter, "export", lambda self, spans: SpanExportResult.SUCCESS)
+    exported = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exported))
+    # A public key of its own, so no client another test opened is reused.
+    client = Langfuse(
+        public_key="pk-unsampled-send",
+        secret_key="sk-unsampled-send",
+        base_url=_OFFLINE_URL,
+        tracer_provider=provider,
+    )
+    fake = _with_items("a", "b")
+    # A push writes the case id into each item's metadata, which the task reads.
+    data = [
+        fake.items[_item_id(case_id)].model_copy(update={"metadata": {"case_id": case_id}})
+        for case_id in ("a", "b")
+    ]
+    tracer = TracerProvider(sampler=ALWAYS_OFF).get_tracer("caller")
+
+    try:
+        with tracer.start_as_current_span("caller") as caller:
+            _send(
+                client=client,
+                run=_TWO_CASES,
+                run_name="search/run abc123 0",
+                experiment_id="experiment-1",
+                data=data,
+                outputs={"a": 1, "b": 2},
+            )
+            current = otel_trace.get_current_span()
+    finally:
+        client.shutdown()
+
+    assert current is caller
+    item_spans = [span for span in exported.get_finished_spans() if span.parent is None]
+    assert len(item_spans) == 2
